@@ -939,9 +939,20 @@ function App() {
             <div className="hidden sm:block text-xs font-mono text-slate-200 border border-[#e00025]/30 px-2 py-1 rounded bg-[#e00025]/10">
               Build 2025.15
             </div>
-            <span className="text-[11px] text-slate-200 px-2 py-1 border border-[#032ea1]/40 rounded-lg bg-[#032ea1]/10">
-              Settings disabled
-            </span>
+            {SETTINGS_ENABLED ? (
+              <button
+                type="button"
+                onClick={() => setShowSettings(true)}
+                className="inline-flex items-center gap-2 text-[11px] text-slate-100 px-3 py-1.5 border border-[#032ea1]/50 rounded-lg bg-[#032ea1]/20 hover:border-indigo-400/70 hover:bg-[#032ea1]/30 transition-colors"
+              >
+                <Icons.Settings className="w-4 h-4" />
+                <span>{config.useServer ? 'Server mode' : 'Mock mode'}</span>
+              </button>
+            ) : (
+              <span className="text-[11px] text-slate-200 px-2 py-1 border border-[#032ea1]/40 rounded-lg bg-[#032ea1]/10">
+                Settings disabled
+              </span>
+            )}
           </div>
         </div>
       </header>
