@@ -22,6 +22,8 @@ export interface ApiConfig {
   filenameTemplate?: string;
 }
 
+export type PlaylistCombineMode = 'audio' | 'video' | 'zip';
+
 // Default to true. We use 127.0.0.1 because 'localhost' can sometimes 
 // fail due to IPv4/IPv6 resolution differences in Node vs Browser.
 let currentConfig: ApiConfig = {
@@ -140,7 +142,14 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
   }
 };
 
-const downloadVideoReal = async (url: string, formatId: string, onProgress: (data: DownloadProgress) => void, expectedFileSize?: number, convertToMp3: boolean = false): Promise<Blob> => {
+const downloadVideoReal = async (
+    url: string,
+    formatId: string,
+    onProgress: (data: DownloadProgress) => void,
+    expectedFileSize?: number,
+    convertToMp3: boolean = false,
+    options?: { playlistCombine?: PlaylistCombineMode; karaoke?: boolean }
+): Promise<Blob> => {
     const baseUrl = currentConfig.serverUrl.replace(/\/$/, '');
     let endpoint = `${baseUrl}/api/download?url=${encodeURIComponent(url)}&format=${formatId}`;
     if (convertToMp3) {
@@ -148,6 +157,12 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
     }
     if (currentConfig.filenameTemplate) {
         endpoint += `&filename_template=${encodeURIComponent(currentConfig.filenameTemplate)}`;
+    }
+    if (options?.playlistCombine) {
+        endpoint += `&playlist_combine=${options.playlistCombine}`;
+    }
+    if (options?.karaoke) {
+        endpoint += `&karaoke=true`;
     }
     
     try {
@@ -344,7 +359,12 @@ const fetchVideoInfoMock = async (url: string): Promise<VideoInfo> => {
   });
 };
 
-const downloadVideoMock = (formatId: string, onProgress: (data: DownloadProgress) => void, convertToMp3: boolean = false): Promise<Blob> => {
+const downloadVideoMock = (
+  formatId: string,
+  onProgress: (data: DownloadProgress) => void,
+  convertToMp3: boolean = false,
+  options?: { playlistCombine?: PlaylistCombineMode; karaoke?: boolean }
+): Promise<Blob> => {
   return new Promise((resolve) => {
     let progress = 0;
     const interval = setInterval(() => {
@@ -366,7 +386,8 @@ const downloadVideoMock = (formatId: string, onProgress: (data: DownloadProgress
         onProgress({ ...stats, progress: 100, eta: '0s' });
         setTimeout(() => {
             // Return a dummy blob
-            resolve(new Blob(["Simulated Video Content"], { type: convertToMp3 ? 'audio/mpeg' : 'video/mp4' }));
+            const shouldUseMp4 = options?.playlistCombine === 'video' || !convertToMp3;
+            resolve(new Blob(["Simulated Video Content"], { type: shouldUseMp4 ? 'video/mp4' : 'audio/mpeg' }));
         }, 500);
       } else {
         onProgress(stats);
@@ -384,9 +405,16 @@ export const fetchVideoInfo = async (url: string): Promise<MediaInfo> => {
     return fetchVideoInfoMock(url);
 };
 
-export const simulateDownload = async (formatId: string, url: string, onProgress: (data: DownloadProgress) => void, fileSize?: number, convertToMp3: boolean = false): Promise<Blob> => {
+export const simulateDownload = async (
+    formatId: string,
+    url: string,
+    onProgress: (data: DownloadProgress) => void,
+    fileSize?: number,
+    convertToMp3: boolean = false,
+    options?: { playlistCombine?: PlaylistCombineMode; karaoke?: boolean }
+): Promise<Blob> => {
     if (currentConfig.useServer) {
-        return downloadVideoReal(url, formatId, onProgress, fileSize, convertToMp3);
+        return downloadVideoReal(url, formatId, onProgress, fileSize, convertToMp3, options);
     }
-    return downloadVideoMock(formatId, onProgress, convertToMp3);
+    return downloadVideoMock(formatId, onProgress, convertToMp3, options);
 };

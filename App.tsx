@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Icons } from './constants';
 import { Logo } from './components/Logo';
 import { VideoInfo, PlaylistInfo, MediaInfo, FormatType, VideoFormat } from './types';
-import { fetchVideoInfo, simulateDownload, DownloadProgress, updateApiConfig, getApiConfig } from './services/mockYtDlpService';
+import { fetchVideoInfo, simulateDownload, DownloadProgress, updateApiConfig, getApiConfig, PlaylistCombineMode } from './services/mockYtDlpService';
 import { VideoCard } from './components/VideoCard';
 import { FormatSelector } from './components/FormatSelector';
 import { PlaylistCard } from './components/PlaylistCard';
@@ -196,6 +196,8 @@ function App() {
   const [selectedVideoFromPlaylist, setSelectedVideoFromPlaylist] = useState<VideoInfo | null>(null);
   const [customTitle, setCustomTitle] = useState('');
   const [playlistMode, setPlaylistMode] = useState<'video' | 'audio'>('video');
+  const [playlistOutputMode, setPlaylistOutputMode] = useState<'zip' | 'single_audio' | 'single_video'>('zip');
+  const [karaokeMode, setKaraokeMode] = useState(false);
   
   const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'completed'>('idle');
   const [progress, setProgress] = useState(0);
@@ -264,6 +266,8 @@ function App() {
     setSelectedFormat(recommended);
     setConvertToMp3(false);
     setPlaylistMode('video');
+    setPlaylistOutputMode('zip');
+    setKaraokeMode(false);
     setDownloadState('idle');
     setCustomTitle(video.title);
   };
@@ -278,6 +282,8 @@ function App() {
     setSelectedFormat(null);
     setConvertToMp3(false);
     setPlaylistMode('video');
+    setPlaylistOutputMode('zip');
+    setKaraokeMode(false);
     setDownloadState('idle');
     setSelectedVideoFromPlaylist(null);
     setCustomTitle('');
@@ -332,6 +338,10 @@ function App() {
 
   const handleDownload = async () => {
     if (!selectedFormat) return;
+    if (karaokeMode && convertToMp3) {
+      setError("Karaoke requires MP4 (turn off MP3 mode).");
+      return;
+    }
     setDownloadState('downloading');
     setDownloadLogs([]);
     lastLoggedPercent.current = 0;
@@ -350,6 +360,7 @@ function App() {
       convertToMp3
     );
     const expectedSize = selectedFormatObj?.filesize;
+    const karaokeEnabled = karaokeMode;
 
     try {
         const downloadTargetUrl = selectedVideoFromPlaylist ? selectedVideoFromPlaylist.webpage_url : url;
@@ -366,7 +377,8 @@ function App() {
                 }
             }, 
             expectedSize,
-            convertToMp3
+            convertToMp3,
+            { karaoke: karaokeEnabled }
         );
         
         // Trigger file save
@@ -422,8 +434,22 @@ function App() {
 
     try {
       const playlistTitle = safeTrim(customTitle) || videoInfo.title || 'playlist';
+      const playlistCombine =
+        playlistOutputMode === 'single_audio'
+          ? 'audio'
+          : playlistOutputMode === 'single_video'
+          ? 'video'
+          : 'zip';
+      const karaokeEnabled = karaokeMode && playlistCombine === 'video';
+      if (karaokeMode && playlistCombine !== 'video') {
+        setError("Karaoke requires single MP4 output.");
+        setDownloadState('idle');
+        return;
+      }
+      const requestFormat = playlistMode === 'audio' ? 'bestaudio' : 'best';
+      const convertFlag = playlistCombine === 'audio' || playlistMode === 'audio';
       const blob = await simulateDownload(
-        playlistMode === 'audio' ? 'bestaudio' : 'best',
+        requestFormat,
         url,
         (data: DownloadProgress) => {
           setProgress(data.progress);
@@ -435,12 +461,20 @@ function App() {
           }
         },
         undefined,
-        playlistMode === 'audio'
+        convertFlag,
+        { playlistCombine: playlistCombine as PlaylistCombineMode, karaoke: karaokeEnabled }
       );
 
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      const ext = playlistMode === 'audio' ? 'mp3_bundle.zip' : 'video_bundle.zip';
+      const ext =
+        playlistCombine === 'audio'
+          ? 'mp3'
+          : playlistCombine === 'video'
+          ? 'mp4'
+          : playlistMode === 'audio'
+          ? 'mp3_bundle.zip'
+          : 'video_bundle.zip';
       const downloadName = formatFilename(
         config.filenameTemplate,
         {
@@ -857,12 +891,52 @@ function App() {
                       className={`px-3 py-1.5 rounded-lg font-semibold transition-all ${
                         playlistMode === "audio"
                           ? "bg-pink-600 text-white shadow-md shadow-pink-600/30"
-                          : "hover:bg-slate-700"
+                        : "hover:bg-slate-700"
                       }`}
                     >
                       MP3 Only
                     </button>
                   </div>
+                </div>
+                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                  <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700 rounded-xl p-1 text-[11px] text-slate-200 w-full lg:w-auto">
+                    {[
+                      { id: "zip", label: "ZIP (separate files)" },
+                      { id: "single_audio", label: "Single MP3" },
+                      { id: "single_video", label: "Single MP4" },
+                    ].map((option) => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        onClick={() => setPlaylistOutputMode(option.id as typeof playlistOutputMode)}
+                        className={`px-3 py-1.5 rounded-lg font-semibold transition-all ${
+                          playlistOutputMode === option.id
+                            ? "bg-emerald-600 text-white shadow-md shadow-emerald-600/30"
+                            : "hover:bg-slate-700"
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="flex items-center gap-3 text-sm text-slate-200 bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2 w-full lg:w-auto">
+                    <div className="flex flex-col">
+                      <span className="font-semibold">Karaoke (music only)</span>
+                      <span className="text-[11px] text-slate-400">
+                        Strips center vocals when merging or exporting audio.
+                      </span>
+                    </div>
+                    <div className="relative">
+                      <input
+                        type="checkbox"
+                        className="sr-only peer"
+                        checked={karaokeMode}
+                        onChange={(e) => setKaraokeMode(e.target.checked)}
+                        disabled={playlistOutputMode === "zip"}
+                      />
+                      <div className={`w-11 h-6 rounded-full ${playlistOutputMode === "zip" ? "opacity-40" : ""} bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-pink-800 peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-pink-600`}></div>
+                    </div>
+                  </label>
                 </div>
                 <button
                   onClick={handleDownloadPlaylist}
@@ -1021,6 +1095,29 @@ function App() {
                           onChange={(e) => setConvertToMp3(e.target.checked)}
                         />
                         <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-pink-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-pink-600"></div>
+                      </label>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-800/30 p-4 rounded-xl mb-6 border border-slate-700/50">
+                      <div className="flex items-center gap-3">
+                        <div className="bg-indigo-500/10 text-indigo-300 p-2 rounded-lg">
+                          <Icons.MicOff className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <div className="font-semibold text-white">Karaoke (music only)</div>
+                          <div className="text-xs text-slate-400">
+                            Removes center vocals; requires MP4 output.
+                          </div>
+                        </div>
+                      </div>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="sr-only peer"
+                          checked={karaokeMode}
+                          onChange={(e) => setKaraokeMode(e.target.checked)}
+                          disabled={false}
+                        />
+                        <div className={`w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600`}></div>
                       </label>
                     </div>
 

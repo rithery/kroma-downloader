@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from typing import Any, Dict, IO, Optional
+from typing import Any, Dict, IO, Optional, List
 from urllib.request import urlopen, Request
 
 import yt_dlp
@@ -38,6 +38,33 @@ app.add_middleware(
 
 CHUNK_SIZE = 1024 * 256
 DOWNLOAD_GUARD = threading.BoundedSemaphore(value=3)
+# Aggressive vocal removal with wide notches + center cut, then normalization/boost.
+# anequalizer uses t=o (octave) and w=<bandwidth in octaves>; syntax must match ffmpeg 7.
+KARAOKE_FILTERS = [
+    "pan=stereo|c0=c0-c1|c1=c1-c0,"
+    "highpass=f=120,"
+    "lowpass=f=9500,"
+    "anequalizer=f=350:t=o:w=1:g=-12,"
+    "anequalizer=f=800:t=o:w=1:g=-24,"
+    "anequalizer=f=1500:t=o:w=1:g=-28,"
+    "anequalizer=f=3000:t=o:w=1:g=-22,"
+    "anequalizer=f=5000:t=o:w=1:g=-10,"
+    "dynaudnorm=f=250:g=10:p=0.95,"
+    "volume=10dB,"
+    "alimiter",
+    # Fallback: hard center cancellation with broad band reject + gentle shaping
+    "pan=stereo|c0=c0-c1|c1=c1-c0,"
+    "highpass=f=140,"
+    "lowpass=f=8800,"
+    "anequalizer=f=250:t=o:w=2:g=-18,"
+    "anequalizer=f=1200:t=o:w=2:g=-24,"
+    "anequalizer=f=3200:t=o:w=2:g=-18,"
+    "dynaudnorm=f=250:g=9:p=0.9,"
+    "volume=9dB,"
+    "alimiter",
+    # Simplest fallback: center cut + light shaping (no notches) to avoid option issues
+    "pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=140,lowpass=f=9000,volume=8dB,alimiter",
+]
 
 
 DEFAULT_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
@@ -65,6 +92,11 @@ def build_ydl_opts(
         options["merge_output_format"] = merge_output_format
 
     if convert_to_mp3:
+        if karaoke:
+            raise HTTPException(
+                status_code=400,
+                detail="Karaoke mode requires MP4/video output, not MP3.",
+            )
         # Convert the downloaded file to a high-quality mp3 via ffmpeg
         options["postprocessors"] = [
             {
@@ -108,6 +140,62 @@ def build_filename(template: Optional[str], info: Dict[str, Any], ext: str) -> s
         except Exception:
             pass
     return sanitize_filename(info.get("title") or info.get("id") or "download", ext)
+
+
+def write_concat_file(files: List[str], temp_dir: str) -> str:
+    """Create an ffmpeg concat input file for the provided paths."""
+    list_path = os.path.join(temp_dir, "inputs.txt")
+    with open(list_path, "w", encoding="utf-8") as handle:
+        for path in files:
+            safe_path = path.replace("'", "'\\''")
+            handle.write(f"file '{safe_path}'\n")
+    return list_path
+
+
+def apply_karaoke_filter(source_path: str, output_path: str, copy_video: bool = True) -> None:
+    """Apply karaoke filter with fallbacks; raises HTTPException on failure."""
+    errors: list[str] = []
+    for filt in KARAOKE_FILTERS:
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            source_path,
+        ]
+        if copy_video:
+            ffmpeg_cmd.extend(["-map", "0:v:0", "-c:v", "copy"])
+        ffmpeg_cmd.extend(
+            [
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-af",
+                filt,
+                "-ac",
+                "2",
+                "-movflags",
+                "faststart",
+                output_path,
+            ]
+        )
+        try:
+            ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail="ffmpeg is required for karaoke mode") from exc
+        if ffmpeg_proc.returncode == 0 and os.path.exists(output_path):
+            return
+        errors.append(ffmpeg_proc.stderr.strip() or "ffmpeg failed")
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            pass
+    raise HTTPException(
+        status_code=500,
+        detail="Karaoke filter failed:\n" + "\n".join(errors[-2:]),
+    )
 
 
 def download_thumbnail(thumbnail_url: Optional[str]) -> Optional[str]:
@@ -210,6 +298,11 @@ async def download(
     format: str = Query("best", description="yt-dlp format identifier"),
     convert_to_mp3: bool = Query(False, description="Convert output to MP3"),
     filename_template: Optional[str] = Query(None, description="Filename template e.g. {title}-{resolution}"),
+    playlist_combine: Optional[str] = Query(
+        None,
+        description="For playlists: combine all items into a single file. Options: audio, video, zip (default).",
+    ),
+    karaoke: bool = Query(False, description="Attempt to remove vocals (music-only). Applies when re-encoding."),
 ):
     """
     Stream the selected format back to the client.
@@ -227,15 +320,123 @@ async def download(
             pre_info = sniff_ydl.extract_info(url, download=False)
 
         is_playlist = pre_info.get("_type") == "playlist"
+        combine_mode: Optional[str] = None
+        if playlist_combine:
+            normalized = playlist_combine.lower()
+            if normalized not in {"audio", "video", "zip"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid playlist_combine option. Use one of: audio, video, zip.",
+                )
+            combine_mode = None if normalized == "zip" else normalized
+        if karaoke and combine_mode == "audio":
+            raise HTTPException(
+                status_code=400,
+                detail="Karaoke mode requires single MP4 playlist output.",
+            )
 
         # Playlist downloads still use the temp-file + zip flow for now.
         if is_playlist:
             temp_dir = tempfile.mkdtemp(prefix="apsaraflow_")
             try:
-                ydl_opts = build_ydl_opts(temp_dir, format, convert_to_mp3, allow_playlist=True)
+                ydl_opts = build_ydl_opts(
+                    temp_dir,
+                    format,
+                    convert_to_mp3 if not combine_mode else False,
+                    allow_playlist=True,
+                )
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.extract_info(url, download=True)
+
+                downloaded_paths = sorted(
+                    [
+                        os.path.join(temp_dir, name)
+                        for name in os.listdir(temp_dir)
+                        if os.path.isfile(os.path.join(temp_dir, name))
+                    ]
+                )
+                if not downloaded_paths:
+                    raise HTTPException(status_code=500, detail="No playlist items were downloaded.")
+
+                if combine_mode:
+                    concat_list = write_concat_file(downloaded_paths, temp_dir)
+                    if combine_mode == "audio":
+                        output_ext = "mp3"
+                        output_path = os.path.join(temp_dir, "playlist_merged.mp3")
+                        ffmpeg_cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                            concat_list,
+                            "-vn",
+                            "-acodec",
+                            "libmp3lame",
+                            "-b:a",
+                            "320k",
+                        ]
+                        if karaoke:
+                            ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
+                    else:  # combine_mode == "video"
+                        output_ext = "mp4"
+                        output_path = os.path.join(temp_dir, "playlist_merged.mp4")
+                        ffmpeg_cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                            concat_list,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            "22",
+                            "-c:a",
+                            "aac",
+                            "-movflags",
+                            "faststart",
+                        ]
+                        if karaoke:
+                            ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
+
+                        ffmpeg_cmd.append(output_path)
+                        try:
+                            ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                        except FileNotFoundError as exc:
+                            raise HTTPException(status_code=500, detail="ffmpeg is required for playlist merging") from exc
+
+                    if ffmpeg_proc.returncode != 0:
+                        stderr = ffmpeg_proc.stderr.strip() or "FFmpeg failed to merge playlist."
+                        raise HTTPException(status_code=500, detail=stderr)
+
+                    if not os.path.exists(output_path):
+                        raise HTTPException(status_code=500, detail="Merged playlist output not created.")
+
+                    final_path = output_path
+                    if karaoke and combine_mode == "video":
+                        karaoke_path = os.path.join(temp_dir, "playlist_karaoke.mp4")
+                        apply_karaoke_filter(output_path, karaoke_path, copy_video=True)
+                        final_path = karaoke_path
+
+                    safe_name = sanitize_filename(
+                        build_filename(filename_template, pre_info, output_ext), output_ext
+                    )
+                    media_type = "audio/mpeg" if combine_mode == "audio" else "video/mp4"
+                    background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+                    return FileResponse(
+                        path=final_path,
+                        media_type=media_type,
+                        filename=safe_name,
+                        background=background,
+                    )
 
                 archive_base = temp_dir
                 archive_path = shutil.make_archive(archive_base, "zip", temp_dir)
@@ -284,6 +485,8 @@ async def download(
         # download to disk and let yt-dlp/ffmpeg handle muxing, then serve the file.
         needs_merge = False
         is_audio_only = False
+        if karaoke and convert_to_mp3:
+            raise HTTPException(status_code=400, detail="Karaoke mode requires MP4 video output.")
         if not convert_to_mp3:
             if "+" in format:
                 needs_merge = True
@@ -291,6 +494,8 @@ async def download(
                 needs_merge = True
             elif base_format and (not base_format.get("vcodec") or base_format.get("vcodec") == "none"):
                 is_audio_only = True
+            if karaoke:
+                needs_merge = True  # force file flow so we can filter audio
 
         # MP3 conversion: use temp files so we can surface errors cleanly.
         if convert_to_mp3:
@@ -320,8 +525,10 @@ async def download(
                     "libmp3lame",
                     "-b:a",
                     "320k",
-                    output_path,
                 ]
+                if karaoke:
+                    ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
+                ffmpeg_cmd.append(output_path)
                 try:
                     ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
                 except FileNotFoundError as exc:
@@ -354,6 +561,8 @@ async def download(
 
         # Audio-only: download to file and return directly to avoid stdout issues with some HLS/DASH audio formats.
         if is_audio_only:
+            if karaoke:
+                raise HTTPException(status_code=400, detail="Karaoke mode requires a video format.")
             temp_dir = tempfile.mkdtemp(prefix="apsaraflow_audio_")
             try:
                 ydl_opts = build_ydl_opts(temp_dir, format, False, allow_playlist=False)
@@ -373,9 +582,32 @@ async def download(
                 guessed_ext = os.path.splitext(output_path)[1].lstrip(".") or "webm"
                 if guessed_ext.lower() in ("m4a", "mp4", "m4v"):
                     media_type = "audio/mp4"
-                download_name = filename
-                if not download_name.lower().endswith(f".{guessed_ext.lower()}"):
-                    download_name = f"{download_name.rsplit('.', 1)[0]}.{guessed_ext}"
+                if karaoke:
+                    karaoke_path = os.path.join(temp_dir, "karaoke.mp3")
+                    ffmpeg_cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        output_path,
+                        "-vn",
+                        "-acodec",
+                        "libmp3lame",
+                        "-b:a",
+                        "320k",
+                        "-af",
+                        KARAOKE_FILTER,
+                        karaoke_path,
+                    ]
+                    try:
+                        ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    except FileNotFoundError as exc:
+                        raise HTTPException(status_code=500, detail="ffmpeg is required for karaoke mode") from exc
+                    if ffmpeg_proc.returncode != 0:
+                        stderr = ffmpeg_proc.stderr.strip() or "FFmpeg failed to create karaoke audio."
+                        raise HTTPException(status_code=500, detail=stderr)
+                    output_path = karaoke_path
+                    media_type = "audio/mpeg"
+                    guessed_ext = "mp3"
 
                 safe_name = sanitize_filename(filename, guessed_ext)
                 background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
@@ -416,13 +648,19 @@ async def download(
                 if not os.path.exists(output_path):
                     raise HTTPException(status_code=500, detail="Muxed video was not created.")
 
+                final_path = output_path
+                if karaoke:
+                    karaoke_path = os.path.join(temp_dir, "karaoke.mp4")
+                    apply_karaoke_filter(output_path, karaoke_path, copy_video=True)
+                    final_path = karaoke_path
+
                 safe_name = sanitize_filename(
                     filename if filename.endswith(".mp4") else f"{filename.rsplit('.', 1)[0]}.mp4",
                     "mp4",
                 )
                 background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
                 return FileResponse(
-                    path=output_path,
+                    path=final_path,
                     media_type="video/mp4",
                     filename=safe_name,
                     background=background,
@@ -438,6 +676,11 @@ async def download(
                 raise HTTPException(status_code=500, detail=str(exc))
 
         # Streaming path (no conversion)
+        if karaoke:
+            raise HTTPException(
+                status_code=400,
+                detail="Karaoke mode requires MP4 merge path; pick a video format.",
+            )
         content_type = "application/octet-stream"
         content_length = None
         if selected_format:
