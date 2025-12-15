@@ -6,10 +6,15 @@ interface PlaylistCardProps {
   info: PlaylistInfo;
   onVideoSelect: (video: VideoInfo) => void;
   selectedVideoId?: string;
+  truncated?: boolean;
+  onLoadMore?: () => void;
+  loadingMore?: boolean;
+  pageSize?: number;
 }
 
-export const PlaylistCard: React.FC<PlaylistCardProps> = ({ info, onVideoSelect, selectedVideoId }) => {
+export const PlaylistCard: React.FC<PlaylistCardProps> = ({ info, onVideoSelect, selectedVideoId, truncated, onLoadMore, loadingMore, pageSize }) => {
   const [imgError, setImgError] = useState(false);
+  const nextBatchSize = Math.max(1, Math.min(info.video_count - info.videos.length, pageSize || 50));
 
   const formatDuration = (seconds?: number) => {
     if (!Number.isFinite(seconds) || seconds! < 0) return '—';
@@ -45,12 +50,42 @@ export const PlaylistCard: React.FC<PlaylistCardProps> = ({ info, onVideoSelect,
           <h2 className="text-xl font-bold text-white leading-tight">{info.title || 'Untitled playlist'}</h2>
           <p className="text-indigo-400 font-medium">{info.uploader || 'Unknown uploader'}</p>
           <p className="text-sm text-slate-400 line-clamp-2">{info.description || 'No description provided.'}</p>
-          <div className="pt-2 flex items-center gap-4 text-xs text-slate-500">
-             <span>{info.video_count} videos</span>
-             <span>ID: {info.id || 'N/A'}</span>
-          </div>
-        </div>
+      <div className="pt-2 flex items-center gap-4 text-xs text-slate-500">
+         <span>{info.video_count} videos</span>
+         <span>ID: {info.id || 'N/A'}</span>
       </div>
+    </div>
+  </div>
+
+      {(truncated || info.video_count > info.videos.length) && (
+        <div className="bg-amber-900/30 border border-amber-800/60 text-amber-100 text-sm rounded-xl px-3 py-2 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Icons.AlertTriangle className="w-4 h-4" />
+            <span>
+              Showing first {info.videos.length} of {info.video_count} items. Large playlists are capped to keep things fast.
+            </span>
+          </div>
+          {onLoadMore && (
+            <button
+              onClick={onLoadMore}
+              disabled={loadingMore}
+              className="inline-flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/50 hover:bg-amber-500/30 disabled:opacity-60"
+            >
+              {loadingMore ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <span>Fetching next batch...</span>
+                </>
+              ) : (
+                <>
+                  <Icons.Download className="w-4 h-4" />
+                  <span>Load next {nextBatchSize} items</span>
+                </>
+              )}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Video List */}
       <div className="space-y-2">

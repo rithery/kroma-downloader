@@ -14,6 +14,8 @@ export interface DownloadProgress {
   progress: number;
   speed: string;
   eta: string;
+  downloadedBytes?: number;
+  totalBytes?: number;
 }
 
 export interface ApiConfig {
@@ -23,6 +25,10 @@ export interface ApiConfig {
 }
 
 export type PlaylistCombineMode = 'audio' | 'video' | 'zip';
+export interface PlaylistFetchOptions {
+  allowLargePlaylist?: boolean;
+  maxItems?: number;
+}
 
 // Default to true. We use 127.0.0.1 because 'localhost' can sometimes 
 // fail due to IPv4/IPv6 resolution differences in Node vs Browser.
@@ -40,10 +46,13 @@ export const getApiConfig = () => currentConfig;
 
 // --- REAL IMPLEMENTATION ---
 
-const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
+const fetchVideoInfoReal = async (url: string, options?: PlaylistFetchOptions): Promise<MediaInfo> => {
   // Ensure no trailing slash
   const baseUrl = currentConfig.serverUrl.replace(/\/$/, '');
-  const endpoint = `${baseUrl}/api/info?url=${encodeURIComponent(url)}`;
+  const params = new URLSearchParams({ url });
+  if (options?.allowLargePlaylist) params.append('allow_large_playlist', 'true');
+  if (options?.maxItems) params.append('max_items', String(options.maxItems));
+  const endpoint = `${baseUrl}/api/info?${params.toString()}`;
   
   try {
     // Add a timeout to the fetch so it doesn't hang forever
@@ -67,7 +76,7 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
     
     // Check if it's a playlist
     if (data._type === 'playlist') {
-      return {
+      const playlistResult: PlaylistInfo = {
         id: data.id,
         title: data.title,
         uploader: data.uploader || data.uploader_id || 'Unknown',
@@ -97,7 +106,11 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
           tbr: f.tbr
         })).filter((f: any) => f.format_id)
       }))
-    } as PlaylistInfo;
+    };
+    if (typeof data.truncated === 'boolean') {
+      playlistResult.truncated = data.truncated;
+    }
+    return playlistResult;
   }
     
     // Transform backend data to our frontend VideoInfo interface
@@ -198,7 +211,7 @@ const downloadVideoReal = async (
         let lastUpdate = startTime;
 
         // Fire an initial progress event so the UI does not sit at 0%
-        onProgress({ progress: 0, speed: 'Starting...', eta: 'calculating...' });
+        onProgress({ progress: 0, speed: 'Starting...', eta: 'calculating...', downloadedBytes: 0, totalBytes: contentLength || undefined });
 
         while(true) {
             const {done, value} = await reader.read();
@@ -240,14 +253,16 @@ const downloadVideoReal = async (
                 onProgress({
                     progress,
                     speed: `${speedMBps} MB/s`,
-                    eta
+                    eta,
+                    downloadedBytes: receivedLength,
+                    totalBytes: contentLength || undefined
                 });
                 lastUpdate = now;
             }
         }
 
-        onProgress({ progress: 100, speed: 'Done', eta: '0s' });
-        return new Blob(chunks);
+        onProgress({ progress: 100, speed: 'Done', eta: '0s', downloadedBytes: receivedLength, totalBytes: contentLength || undefined });
+        return new Blob(chunks as BlobPart[]);
     } catch (error: any) {
         if (error.name === 'TypeError' && (error.message.includes('fetch') || error.message.includes('Failed to fetch'))) {
             throw new Error("Lost connection to server during download.");
@@ -308,7 +323,7 @@ const generateMockFormats = () => [
   }
 ];
 
-const fetchVideoInfoMock = async (url: string): Promise<VideoInfo> => {
+const fetchVideoInfoMock = async (url: string, _options?: PlaylistFetchOptions): Promise<VideoInfo> => {
   return new Promise((resolve, reject) => {
     setTimeout(() => {
       try {
@@ -363,13 +378,17 @@ const downloadVideoMock = (
   formatId: string,
   onProgress: (data: DownloadProgress) => void,
   convertToMp3: boolean = false,
-  options?: { playlistCombine?: PlaylistCombineMode; karaoke?: boolean }
+  options?: { playlistCombine?: PlaylistCombineMode; karaoke?: boolean },
+  expectedSize?: number
 ): Promise<Blob> => {
   return new Promise((resolve) => {
     let progress = 0;
+    const totalBytes = expectedSize && expectedSize > 0 ? expectedSize : 120 * 1024 * 1024; // 120MB default mock size
+    let downloadedBytes = 0;
     const interval = setInterval(() => {
       const increment = Math.random() * 2 + 1; 
       progress += increment;
+      downloadedBytes = Math.min(totalBytes, (progress / 100) * totalBytes);
       
       const remainingPercent = 100 - progress;
       const speedVal = (Math.random() * 15 + 5).toFixed(1);
@@ -378,7 +397,9 @@ const downloadVideoMock = (
       const stats: DownloadProgress = {
         progress: Math.min(progress, 100),
         speed: `${speedVal} MB/s`,
-        eta: `${estimatedSeconds}s`
+        eta: `${estimatedSeconds}s`,
+        downloadedBytes,
+        totalBytes
       };
 
       if (progress >= 100) {
@@ -398,11 +419,11 @@ const downloadVideoMock = (
 
 // --- PUBLIC API DELEGATES ---
 
-export const fetchVideoInfo = async (url: string): Promise<MediaInfo> => {
+export const fetchVideoInfo = async (url: string, options?: PlaylistFetchOptions): Promise<MediaInfo> => {
     if (currentConfig.useServer) {
-        return fetchVideoInfoReal(url);
+        return fetchVideoInfoReal(url, options);
     }
-    return fetchVideoInfoMock(url);
+    return fetchVideoInfoMock(url, options);
 };
 
 export const simulateDownload = async (
@@ -416,5 +437,5 @@ export const simulateDownload = async (
     if (currentConfig.useServer) {
         return downloadVideoReal(url, formatId, onProgress, fileSize, convertToMp3, options);
     }
-    return downloadVideoMock(formatId, onProgress, convertToMp3, options);
+    return downloadVideoMock(formatId, onProgress, convertToMp3, options, fileSize);
 };

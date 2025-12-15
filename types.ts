@@ -38,6 +38,7 @@ export interface PlaylistInfo {
   webpage_url: string;
   video_count: number;
   videos: VideoInfo[];
+  truncated?: boolean; // true when the backend limited results (needs load more)
 }
 
 export interface AiMetadataResult {

@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
-from typing import Any, Dict, IO, Optional, List
+from typing import Any, Dict, Optional, List
 from urllib.request import urlopen, Request
 
 import yt_dlp
@@ -35,9 +35,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 CHUNK_SIZE = 1024 * 256
-DOWNLOAD_GUARD = threading.BoundedSemaphore(value=3)
+MAX_CONCURRENT = max(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3") or "3"), 1)
+DOWNLOAD_GUARD = threading.BoundedSemaphore(value=MAX_CONCURRENT)
 # Aggressive vocal removal with wide notches + center cut, then normalization/boost.
 # anequalizer uses t=o (octave) and w=<bandwidth in octaves>; syntax must match ffmpeg 7.
 KARAOKE_FILTERS = [
@@ -66,6 +66,8 @@ KARAOKE_FILTERS = [
     "pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=140,lowpass=f=9000,volume=8dB,alimiter",
 ]
 
+DEFAULT_MAX_PLAYLIST_ITEMS = max(int(os.getenv("MAX_PLAYLIST_ITEMS", "50") or "50"), 1)
+
 
 DEFAULT_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
 
@@ -92,11 +94,6 @@ def build_ydl_opts(
         options["merge_output_format"] = merge_output_format
 
     if convert_to_mp3:
-        if karaoke:
-            raise HTTPException(
-                status_code=400,
-                detail="Karaoke mode requires MP4/video output, not MP3.",
-            )
         # Convert the downloaded file to a high-quality mp3 via ffmpeg
         options["postprocessors"] = [
             {
@@ -217,8 +214,35 @@ async def root() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/health")
+async def healthcheck() -> Dict[str, Any]:
+    """Return service readiness and tool versions."""
+    ffmpeg_version = None
+    try:
+        proc = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=2)
+        if proc.returncode == 0:
+            ffmpeg_version = proc.stdout.splitlines()[0]
+    except FileNotFoundError:
+        ffmpeg_version = None
+    except Exception:
+        ffmpeg_version = "ffmpeg check failed"
+
+    yt_dlp_version = getattr(yt_dlp, "__version__", None)
+    return {
+        "status": "ok",
+        "yt_dlp": yt_dlp_version,
+        "ffmpeg": ffmpeg_version or "missing",
+        "max_concurrent_downloads": MAX_CONCURRENT,
+        "default_max_playlist_items": DEFAULT_MAX_PLAYLIST_ITEMS,
+    }
+
+
 @app.get("/api/info")
-async def fetch_info(url: str = Query(..., description="Video or audio URL")) -> Dict[str, Any]:
+async def fetch_info(
+    url: str = Query(..., description="Video or audio URL"),
+    allow_large_playlist: bool = Query(False, description="Allow fetching more than the default playlist cap."),
+    max_items: int = Query(DEFAULT_MAX_PLAYLIST_ITEMS, ge=1, le=500, description="Max playlist items when allow_large_playlist is true."),
+) -> Dict[str, Any]:
     """Return metadata for the provided URL using yt-dlp."""
     try:
         # First check if it's a playlist by extracting info without noplaylist
@@ -242,8 +266,9 @@ async def fetch_info(url: str = Query(..., description="Video or audio URL")) ->
             playlist_info["video_count"] = len(info.get("entries", []))
 
             # Get detailed info for each video (limit to first 50 for performance)
-            videos = []
-            entries = info.get("entries", [])[:50]  # Limit to 50 videos
+            videos: list[Dict[str, Any]] = []
+            playlist_limit = max_items if allow_large_playlist else DEFAULT_MAX_PLAYLIST_ITEMS
+            entries = info.get("entries", [])[:playlist_limit]  # Limit to cap unless explicitly overridden
 
             for entry in entries:
                 if entry:
@@ -270,6 +295,7 @@ async def fetch_info(url: str = Query(..., description="Video or audio URL")) ->
                         continue
 
             playlist_info["videos"] = videos
+            playlist_info["truncated"] = len(info.get("entries", [])) > len(entries)
             playlist_info["_type"] = "playlist"
             return playlist_info
         else:
@@ -379,8 +405,6 @@ async def download(
                             "-b:a",
                             "320k",
                         ]
-                        if karaoke:
-                            ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
                     else:  # combine_mode == "video"
                         output_ext = "mp4"
                         output_path = os.path.join(temp_dir, "playlist_merged.mp4")
@@ -404,14 +428,12 @@ async def download(
                             "-movflags",
                             "faststart",
                         ]
-                        if karaoke:
-                            ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
 
-                        ffmpeg_cmd.append(output_path)
-                        try:
-                            ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                        except FileNotFoundError as exc:
-                            raise HTTPException(status_code=500, detail="ffmpeg is required for playlist merging") from exc
+                    ffmpeg_cmd.append(output_path)
+                    try:
+                        ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                    except FileNotFoundError as exc:
+                        raise HTTPException(status_code=500, detail="ffmpeg is required for playlist merging") from exc
 
                     if ffmpeg_proc.returncode != 0:
                         stderr = ffmpeg_proc.stderr.strip() or "FFmpeg failed to merge playlist."
@@ -526,8 +548,6 @@ async def download(
                     "-b:a",
                     "320k",
                 ]
-                if karaoke:
-                    ffmpeg_cmd.extend(["-af", KARAOKE_FILTER])
                 ffmpeg_cmd.append(output_path)
                 try:
                     ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
@@ -582,32 +602,6 @@ async def download(
                 guessed_ext = os.path.splitext(output_path)[1].lstrip(".") or "webm"
                 if guessed_ext.lower() in ("m4a", "mp4", "m4v"):
                     media_type = "audio/mp4"
-                if karaoke:
-                    karaoke_path = os.path.join(temp_dir, "karaoke.mp3")
-                    ffmpeg_cmd = [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        output_path,
-                        "-vn",
-                        "-acodec",
-                        "libmp3lame",
-                        "-b:a",
-                        "320k",
-                        "-af",
-                        KARAOKE_FILTER,
-                        karaoke_path,
-                    ]
-                    try:
-                        ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-                    except FileNotFoundError as exc:
-                        raise HTTPException(status_code=500, detail="ffmpeg is required for karaoke mode") from exc
-                    if ffmpeg_proc.returncode != 0:
-                        stderr = ffmpeg_proc.stderr.strip() or "FFmpeg failed to create karaoke audio."
-                        raise HTTPException(status_code=500, detail=stderr)
-                    output_path = karaoke_path
-                    media_type = "audio/mpeg"
-                    guessed_ext = "mp3"
 
                 safe_name = sanitize_filename(filename, guessed_ext)
                 background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
@@ -779,6 +773,8 @@ async def download(
             headers=headers,
         )
 
+    except HTTPException:
+        raise
     except Exception as exc:  # pragma: no cover - passthrough error handling
         raise HTTPException(status_code=500, detail=str(exc))
     finally:

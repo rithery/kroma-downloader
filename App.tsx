@@ -87,20 +87,29 @@ const formatFilename = (
   return name;
 };
 
-const SETTINGS_ENABLED = false;
+const SETTINGS_ENABLED = true;
 const AppStatus = {
   IDLE: 'IDLE',
   BUSY: 'BUSY',
 } as const;
 
+const STORAGE_KEYS = {
+  prefs: 'kroma_prefs_v1',
+  recentUrls: 'kroma_recent_urls_v1',
+  recentDownloads: 'kroma_recent_downloads_v1',
+};
+
+const PLAYLIST_PAGE_SIZE = 50;
+const MAX_PLAYLIST_FETCH = 500;
+
 const SUPPORTED_SITES = [
   { name: 'YouTube', patterns: ['youtube.com', 'youtu.be'] },
-  { name: 'TikTok', patterns: ['tiktok.com'] },
-  { name: 'Vimeo', patterns: ['vimeo.com'] },
-  { name: 'Twitter / X', patterns: ['twitter.com', 'x.com'] },
-  { name: 'Instagram', patterns: ['instagram.com'] },
-  { name: 'Reddit', patterns: ['reddit.com'] },
-  { name: 'Facebook', patterns: ['facebook.com', 'fb.watch'] },
+  // { name: 'TikTok', patterns: ['tiktok.com'] },
+  // { name: 'Vimeo', patterns: ['vimeo.com'] },
+  // { name: 'Twitter / X', patterns: ['twitter.com', 'x.com'] },
+  // { name: 'Instagram', patterns: ['instagram.com'] },
+  // { name: 'Reddit', patterns: ['reddit.com'] },
+  // { name: 'Facebook', patterns: ['facebook.com', 'fb.watch'] },
 ];
 
 type UrlInsight =
@@ -196,18 +205,35 @@ function App() {
   const [selectedVideoFromPlaylist, setSelectedVideoFromPlaylist] = useState<VideoInfo | null>(null);
   const [customTitle, setCustomTitle] = useState('');
   const [playlistMode, setPlaylistMode] = useState<'video' | 'audio'>('video');
-  const [playlistOutputMode, setPlaylistOutputMode] = useState<'zip' | 'single_audio' | 'single_video'>('zip');
+  const [playlistLimit, setPlaylistLimit] = useState(PLAYLIST_PAGE_SIZE);
   const [karaokeMode, setKaraokeMode] = useState(false);
+  const [loadingMorePlaylist, setLoadingMorePlaylist] = useState(false);
   
   const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'completed'>('idle');
   const [progress, setProgress] = useState(0);
-  const [stats, setStats] = useState<{ speed: string; eta: string }>({ speed: '--', eta: '--' });
+  const [stats, setStats] = useState<{
+    speed: string;
+    eta: string;
+    downloadedBytes?: number;
+    totalBytes?: number;
+  }>({
+    speed: '--',
+    eta: '--',
+    downloadedBytes: 0,
+    totalBytes: undefined,
+  });
   const [downloadLogs, setDownloadLogs] = useState<string[]>([]);
   const lastLoggedPercent = useRef(0);
   const heroStatus = downloadState === 'idle' ? AppStatus.IDLE : AppStatus.BUSY;
   const [clipboardSuggestion, setClipboardSuggestion] = useState<string | null>(null);
   const [clipboardError, setClipboardError] = useState<string | null>(null);
   const [urlInsight, setUrlInsight] = useState<UrlInsight>({ state: 'idle', message: '' });
+  const [formatFilter, setFormatFilter] = useState<'all' | 'hdr' | 'av1' | 'vp9' | 'audio'>('all');
+  const [recentUrls, setRecentUrls] = useState<string[]>([]);
+  const [recentDownloads, setRecentDownloads] = useState<
+    { title: string; format: string; mp3: boolean; when: number; playlist: boolean }[]
+  >([]);
+  const [bundleExtras, setBundleExtras] = useState({ subtitles: false, chapters: false, thumbnail: true });
 
   // Settings State
   const [showSettings, setShowSettings] = useState(false);
@@ -220,6 +246,76 @@ function App() {
       return updated;
     });
   };
+
+  // Hydrate persisted preferences and history.
+  useEffect(() => {
+    try {
+      const savedPrefs = localStorage.getItem(STORAGE_KEYS.prefs);
+      if (savedPrefs) {
+        const parsed = JSON.parse(savedPrefs);
+        if (typeof parsed.convertToMp3 === 'boolean') setConvertToMp3(parsed.convertToMp3);
+        if (typeof parsed.karaokeMode === 'boolean') setKaraokeMode(parsed.karaokeMode);
+        if (typeof parsed.formatFilter === 'string') setFormatFilter(parsed.formatFilter);
+        if (typeof parsed.customTitle === 'string') setCustomTitle(parsed.customTitle);
+        if (parsed.bundleExtras) {
+          setBundleExtras((prev) => ({ ...prev, ...parsed.bundleExtras }));
+        }
+        if (parsed.config) {
+          setConfig((prev) => {
+            const merged = { ...prev, ...parsed.config };
+            updateApiConfig(merged);
+            return merged;
+          });
+        }
+      }
+      const savedUrls = localStorage.getItem(STORAGE_KEYS.recentUrls);
+      if (savedUrls) {
+        const parsed = JSON.parse(savedUrls);
+        if (Array.isArray(parsed)) setRecentUrls(parsed.slice(0, 10));
+      }
+      const savedDownloads = localStorage.getItem(STORAGE_KEYS.recentDownloads);
+      if (savedDownloads) {
+        const parsed = JSON.parse(savedDownloads);
+        if (Array.isArray(parsed)) setRecentDownloads(parsed.slice(0, 8));
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEYS.prefs,
+        JSON.stringify({
+          convertToMp3,
+          karaokeMode,
+          formatFilter,
+          customTitle,
+          config,
+          bundleExtras,
+        })
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [convertToMp3, karaokeMode, formatFilter, customTitle, config, bundleExtras]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.recentUrls, JSON.stringify(recentUrls.slice(0, 10)));
+    } catch {
+      // ignore storage errors
+    }
+  }, [recentUrls]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEYS.recentDownloads, JSON.stringify(recentDownloads.slice(0, 8)));
+    } catch {
+      // ignore storage errors
+    }
+  }, [recentDownloads]);
 
   // Light clipboard watcher to surface a "paste" suggestion when empty.
   useEffect(() => {
@@ -258,15 +354,66 @@ function App() {
     setUrlInsight(analyzeUrl(url));
   }, [url]);
 
+  const rememberUrl = (value: string) => {
+    if (!value) return;
+    setRecentUrls((prev) => {
+      const next = [value, ...prev.filter((v) => v !== value)];
+      return next.slice(0, 10);
+    });
+  };
+
+  const recordDownload = (payload: { title: string; format: string; mp3: boolean; playlist: boolean }) => {
+    setRecentDownloads((prev) => {
+      const next = [{ ...payload, when: Date.now() }, ...prev].slice(0, 8);
+      return next;
+    });
+  };
+
+  const filterFormatsForDisplay = (formats: VideoFormat[]) => {
+    return formats;
+  };
+
+  const describeSize = (format?: VideoFormat) => {
+    if (!format) return '--';
+    const size = format.filesize || format.filesize_approx;
+    if (size && size > 0) {
+      const mb = size / (1024 * 1024);
+      if (mb > 1024) return `${(mb / 1024).toFixed(2)} GB`;
+      return `${mb.toFixed(1)} MB`;
+    }
+    return 'Unknown size';
+  };
+
+  const formatBytes = (bytes?: number) => {
+    if (bytes === undefined || bytes === null || bytes < 0) return '--';
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+    return `${mb.toFixed(1)} MB`;
+  };
+
   // Handlers
   const handleVideoSelectFromPlaylist = (video: VideoInfo) => {
+    if (selectedVideoFromPlaylist && selectedVideoFromPlaylist.id === video.id) {
+      // Toggle off when clicking the same item
+      setSelectedVideoFromPlaylist(null);
+      setRecommendedFormatId(null);
+      setSelectedFormat(null);
+      setConvertToMp3(false);
+      setPlaylistMode('video');
+      setKaraokeMode(false);
+      setDownloadState('idle');
+      const fallbackTitle =
+        videoInfo && 'title' in videoInfo ? videoInfo.title : '';
+      setCustomTitle(fallbackTitle);
+      return;
+    }
+
     setSelectedVideoFromPlaylist(video);
     const recommended = findRecommendedFormat(video.formats);
     setRecommendedFormatId(recommended);
     setSelectedFormat(recommended);
     setConvertToMp3(false);
     setPlaylistMode('video');
-    setPlaylistOutputMode('zip');
     setKaraokeMode(false);
     setDownloadState('idle');
     setCustomTitle(video.title);
@@ -282,15 +429,16 @@ function App() {
     setSelectedFormat(null);
     setConvertToMp3(false);
     setPlaylistMode('video');
-    setPlaylistOutputMode('zip');
     setKaraokeMode(false);
     setDownloadState('idle');
     setSelectedVideoFromPlaylist(null);
+    setPlaylistLimit(PLAYLIST_PAGE_SIZE);
     setCustomTitle('');
     setRecommendedFormatId(null);
 
     try {
-      const info = await fetchVideoInfo(url);
+      const info = await fetchVideoInfo(url, { maxItems: PLAYLIST_PAGE_SIZE });
+      rememberUrl(url);
       setVideoInfo(info);
       setCustomTitle(info.title);
 
@@ -306,6 +454,49 @@ function App() {
       setError(err.message || "Failed to fetch video info");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleLoadMorePlaylist = async () => {
+    if (!videoInfo || !('videos' in videoInfo)) return;
+    if (loadingMorePlaylist) return;
+
+    const currentCount = videoInfo.videos.length;
+    const nextLimit = Math.min(
+      playlistLimit + PLAYLIST_PAGE_SIZE,
+      MAX_PLAYLIST_FETCH,
+      videoInfo.video_count || MAX_PLAYLIST_FETCH
+    );
+    if (nextLimit <= currentCount) return;
+
+    setLoadingMorePlaylist(true);
+    setError(null);
+    try {
+      const updatedInfo = await fetchVideoInfo(url, {
+        allowLargePlaylist: true,
+        maxItems: nextLimit,
+      });
+      if ('videos' in updatedInfo) {
+        setPlaylistLimit(nextLimit);
+        setVideoInfo(updatedInfo);
+        const selectedId = selectedVideoFromPlaylist?.id;
+        if (selectedId) {
+          const refreshedSelected = updatedInfo.videos.find((v) => v.id === selectedId) || null;
+          setSelectedVideoFromPlaylist(refreshedSelected);
+          if (refreshedSelected) {
+            const stillHasSelectedFormat = refreshedSelected.formats.some((f) => f.format_id === selectedFormat);
+            if (!stillHasSelectedFormat) {
+              const recommended = findRecommendedFormat(refreshedSelected.formats);
+              setRecommendedFormatId(recommended);
+              setSelectedFormat(recommended);
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to load more videos");
+    } finally {
+      setLoadingMorePlaylist(false);
     }
   };
 
@@ -346,7 +537,6 @@ function App() {
     setDownloadLogs([]);
     lastLoggedPercent.current = 0;
     setProgress(0);
-    setStats({ speed: 'Starting...', eta: 'Calculating...' });
 
     // Use selected video from playlist if available, otherwise use main videoInfo
     const currentVideoInfo = selectedVideoFromPlaylist || (videoInfo && 'formats' in videoInfo ? videoInfo : null);
@@ -361,6 +551,7 @@ function App() {
     );
     const expectedSize = selectedFormatObj?.filesize;
     const karaokeEnabled = karaokeMode;
+    setStats({ speed: 'Starting...', eta: 'Calculating...', downloadedBytes: 0, totalBytes: expectedSize });
 
     try {
         const downloadTargetUrl = selectedVideoFromPlaylist ? selectedVideoFromPlaylist.webpage_url : url;
@@ -369,7 +560,12 @@ function App() {
             downloadTargetUrl, 
             (data: DownloadProgress) => {
                 setProgress(data.progress);
-                setStats({ speed: data.speed, eta: data.eta });
+                setStats({
+                  speed: data.speed,
+                  eta: data.eta,
+                  downloadedBytes: data.downloadedBytes,
+                  totalBytes: data.totalBytes || expectedSize,
+                });
                 const pct = Math.round(data.progress);
                 if (pct - lastLoggedPercent.current >= 10) {
                   setDownloadLogs(prev => [...prev.slice(-20), `[download] ${pct}%`]);
@@ -407,6 +603,12 @@ function App() {
         document.body.removeChild(link);
         window.URL.revokeObjectURL(blobUrl);
 
+        recordDownload({
+          title: titleSource,
+          format: formatForRequest,
+          mp3: convertToMp3,
+          playlist: false,
+        });
         setDownloadState('completed');
         setDownloadLogs(prev => [...prev.slice(-20), '[done] Download complete']);
     } catch (e: any) {
@@ -419,7 +621,7 @@ function App() {
     setTimeout(() => {
         setDownloadState('idle');
         setProgress(0);
-        setStats({ speed: '--', eta: '--' });
+        setStats({ speed: '--', eta: '--', downloadedBytes: 0, totalBytes: undefined });
     }, 3000);
   };
 
@@ -430,30 +632,25 @@ function App() {
     setDownloadLogs([]);
     lastLoggedPercent.current = 0;
     setProgress(0);
-    setStats({ speed: 'Starting...', eta: 'Calculating...' });
+    setStats({ speed: 'Starting...', eta: 'Calculating...', downloadedBytes: 0, totalBytes: undefined });
 
     try {
       const playlistTitle = safeTrim(customTitle) || videoInfo.title || 'playlist';
-      const playlistCombine =
-        playlistOutputMode === 'single_audio'
-          ? 'audio'
-          : playlistOutputMode === 'single_video'
-          ? 'video'
-          : 'zip';
-      const karaokeEnabled = karaokeMode && playlistCombine === 'video';
-      if (karaokeMode && playlistCombine !== 'video') {
-        setError("Karaoke requires single MP4 output.");
-        setDownloadState('idle');
-        return;
-      }
+      const playlistCombine: PlaylistCombineMode = 'zip';
+      const karaokeEnabled = false;
       const requestFormat = playlistMode === 'audio' ? 'bestaudio' : 'best';
-      const convertFlag = playlistCombine === 'audio' || playlistMode === 'audio';
+      const convertFlag = playlistMode === 'audio';
       const blob = await simulateDownload(
         requestFormat,
         url,
         (data: DownloadProgress) => {
           setProgress(data.progress);
-          setStats({ speed: data.speed, eta: data.eta });
+          setStats({
+            speed: data.speed,
+            eta: data.eta,
+            downloadedBytes: data.downloadedBytes,
+            totalBytes: data.totalBytes,
+          });
           const pct = Math.round(data.progress);
           if (pct - lastLoggedPercent.current >= 10) {
             setDownloadLogs(prev => [...prev.slice(-20), `[playlist] ${pct}%`]);
@@ -493,6 +690,12 @@ function App() {
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(blobUrl);
+      recordDownload({
+        title: playlistTitle,
+        format: requestFormat,
+        mp3: convertFlag,
+        playlist: true,
+      });
       setDownloadState('completed');
       setDownloadLogs(prev => [...prev.slice(-20), '[done] Playlist download complete']);
     } catch (e: any) {
@@ -504,14 +707,14 @@ function App() {
     setTimeout(() => {
       setDownloadState('idle');
       setProgress(0);
-      setStats({ speed: '--', eta: '--' });
+      setStats({ speed: '--', eta: '--', downloadedBytes: 0, totalBytes: undefined });
     }, 3000);
   };
 
   const handlePhotoDownload = async (imageUrl: string, title: string) => {
     try {
       setDownloadState('downloading');
-      setStats({ speed: 'Fetching...', eta: '--' });
+      setStats({ speed: 'Fetching...', eta: '--', downloadedBytes: 0, totalBytes: undefined });
       const res = await fetch(imageUrl);
       const blob = await res.blob();
       const blobUrl = window.URL.createObjectURL(blob);
@@ -532,7 +735,7 @@ function App() {
     setTimeout(() => {
       setDownloadState('idle');
       setProgress(0);
-      setStats({ speed: '--', eta: '--' });
+      setStats({ speed: '--', eta: '--', downloadedBytes: 0, totalBytes: undefined });
     }, 2000);
   };
 
@@ -541,14 +744,19 @@ function App() {
     try {
       setDownloadState('downloading');
       setProgress(0);
-      setStats({ speed: 'Starting...', eta: '--' });
+      setStats({ speed: 'Starting...', eta: '--', downloadedBytes: 0, totalBytes: undefined });
 
       const blob = await simulateDownload(
         'best',
         url,
         (data: DownloadProgress) => {
           setProgress(data.progress);
-          setStats({ speed: data.speed, eta: data.eta });
+          setStats({
+            speed: data.speed,
+            eta: data.eta,
+            downloadedBytes: data.downloadedBytes,
+            totalBytes: data.totalBytes,
+          });
         },
         undefined,
         false
@@ -573,9 +781,22 @@ function App() {
     setTimeout(() => {
       setDownloadState('idle');
       setProgress(0);
-      setStats({ speed: '--', eta: '--' });
+      setStats({ speed: '--', eta: '--', downloadedBytes: 0, totalBytes: undefined });
     }, 3000);
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "d") {
+        event.preventDefault();
+        if (downloadState === "idle" && selectedFormat) {
+          handleDownload();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [downloadState, selectedFormat]);
 
   const isServerConnectionError = error?.includes("Could not connect to backend");
 
@@ -718,11 +939,9 @@ function App() {
             <div className="hidden sm:block text-xs font-mono text-slate-200 border border-[#e00025]/30 px-2 py-1 rounded bg-[#e00025]/10">
               Build 2025.15
             </div>
-            {!SETTINGS_ENABLED && (
-              <span className="text-[11px] text-slate-200 px-2 py-1 border border-[#032ea1]/40 rounded-lg bg-[#032ea1]/10">
-                Settings disabled
-              </span>
-            )}
+            <span className="text-[11px] text-slate-200 px-2 py-1 border border-[#032ea1]/40 rounded-lg bg-[#032ea1]/10">
+              Settings disabled
+            </span>
           </div>
         </div>
       </header>
@@ -748,8 +967,8 @@ function App() {
             </h1>
           </div>
           <p className="text-slate-300 mb-8 max-w-lg mx-auto leading-relaxed">
-            Drop any link and KROMA slices the stream, surfaces smart presets, and
-            ships the exact file you want—powered by{" "}
+            Drop any link and KROMA slices the stream, surfaces smart presets,
+            and ships the exact file you want—powered by{" "}
             <span className="text-green-400 font-mono mx-1">yt-dlp</span>.
           </p>
 
@@ -801,16 +1020,16 @@ function App() {
             </div>
             <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-400">
               <span className="px-3 py-1 rounded-full bg-white/5 border border-white/10">
-                Supported: {SUPPORTED_SITES.map((s) => s.name).join(' • ')}
+                Supported: {SUPPORTED_SITES.map((s) => s.name).join(" • ")}
               </span>
-              {urlInsight.state !== 'idle' && (
+              {urlInsight.state !== "idle" && (
                 <span
                   className={`px-3 py-1 rounded-full border ${
-                    urlInsight.state === 'valid'
-                      ? 'border-emerald-700 bg-emerald-900/30 text-emerald-200'
-                      : urlInsight.state === 'warn'
-                      ? 'border-amber-700 bg-amber-900/30 text-amber-200'
-                      : 'border-red-800 bg-red-950/40 text-red-300'
+                    urlInsight.state === "valid"
+                      ? "border-emerald-700 bg-emerald-900/30 text-emerald-200"
+                      : urlInsight.state === "warn"
+                      ? "border-amber-700 bg-amber-900/30 text-amber-200"
+                      : "border-red-800 bg-red-950/40 text-red-300"
                   }`}
                 >
                   {urlInsight.message}
@@ -822,6 +1041,19 @@ function App() {
                 </span>
               )}
             </div>
+            {/* {recentUrls.length > 0 && (
+              <div className="mt-2 flex flex-wrap justify-center gap-2 text-[11px]">
+                {recentUrls.map((entry) => (
+                  <button
+                    key={entry}
+                    onClick={() => setUrl(entry)}
+                    className="px-3 py-1.5 rounded-full border border-slate-700 bg-slate-900/70 text-slate-200 hover:border-indigo-500/60 hover:text-white transition-colors"
+                  >
+                    {entry.length > 42 ? `${entry.slice(0, 42)}…` : entry}
+                  </button>
+                ))}
+              </div>
+            )} */}
           </div>
 
           {error && (
@@ -848,6 +1080,55 @@ function App() {
           )}
         </section>
 
+        {recentDownloads.length > 0 && (
+          <section className="mb-8">
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4 sm:p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-slate-200">
+                  Recent downloads
+                </h3>
+                <span className="text-[11px] text-slate-500">
+                  {recentDownloads.length} saved
+                </span>
+              </div>
+              <div className="space-y-2">
+                {recentDownloads.map((item) => (
+                  <div
+                    key={`${item.title}-${item.when}`}
+                    className="flex items-center justify-between text-xs bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2"
+                  >
+                    <div className="flex flex-col gap-0.5 text-left">
+                      <span className="text-slate-100 font-semibold">
+                        {item.title.length > 60
+                          ? `${item.title.slice(0, 60)}…`
+                          : item.title}
+                      </span>
+                      <div className="flex flex-wrap gap-2 text-[11px] text-slate-400">
+                        <span className="px-2 py-0.5 rounded-full bg-slate-900 border border-slate-700">
+                          {item.format}
+                        </span>
+                        {item.mp3 && (
+                          <span className="px-2 py-0.5 rounded-full bg-pink-700/30 border border-pink-600/50 text-pink-100">
+                            MP3
+                          </span>
+                        )}
+                        {item.playlist && (
+                          <span className="px-2 py-0.5 rounded-full bg-indigo-700/25 border border-indigo-600/50 text-indigo-100">
+                            Playlist
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <span className="text-[10px] text-slate-500 font-mono">
+                      {new Date(item.when).toLocaleTimeString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
         {/* Results Section */}
         {videoInfo && (
           <div className="animate-in fade-in slide-in-from-bottom-8 duration-500 space-y-8">
@@ -856,6 +1137,13 @@ function App() {
                 info={videoInfo}
                 onVideoSelect={handleVideoSelectFromPlaylist}
                 selectedVideoId={selectedVideoFromPlaylist?.id || null}
+                truncated={
+                  videoInfo.truncated ||
+                  videoInfo.video_count > videoInfo.videos.length
+                }
+                onLoadMore={handleLoadMorePlaylist}
+                loadingMore={loadingMorePlaylist}
+                pageSize={PLAYLIST_PAGE_SIZE}
               />
             ) : (
               <VideoCard info={videoInfo} />
@@ -870,7 +1158,7 @@ function App() {
                     </div>
                     <div className="text-xs text-slate-500">
                       Uses yt-dlp via{" "}
-                      {config.useServer ? "your backend" : "the simulator"}.
+                      {config.useServer ? "your backend" : "the simulator"}. Download the whole list, or click any song/video below to grab it individually (and pick the exact quality) like a normal video.
                     </div>
                   </div>
                   <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700 rounded-xl p-1 text-xs text-slate-200">
@@ -887,57 +1175,21 @@ function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => setPlaylistMode("audio")}
+                      onClick={() => {
+                        setKaraokeMode(false);
+                        setPlaylistMode("audio");
+                      }}
                       className={`px-3 py-1.5 rounded-lg font-semibold transition-all ${
                         playlistMode === "audio"
                           ? "bg-pink-600 text-white shadow-md shadow-pink-600/30"
-                        : "hover:bg-slate-700"
+                          : "hover:bg-slate-700"
                       }`}
                     >
                       MP3 Only
                     </button>
                   </div>
                 </div>
-                <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
-                  <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700 rounded-xl p-1 text-[11px] text-slate-200 w-full lg:w-auto">
-                    {[
-                      { id: "zip", label: "ZIP (separate files)" },
-                      { id: "single_audio", label: "Single MP3" },
-                      { id: "single_video", label: "Single MP4" },
-                    ].map((option) => (
-                      <button
-                        key={option.id}
-                        type="button"
-                        onClick={() => setPlaylistOutputMode(option.id as typeof playlistOutputMode)}
-                        className={`px-3 py-1.5 rounded-lg font-semibold transition-all ${
-                          playlistOutputMode === option.id
-                            ? "bg-emerald-600 text-white shadow-md shadow-emerald-600/30"
-                            : "hover:bg-slate-700"
-                        }`}
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                  <label className="flex items-center gap-3 text-sm text-slate-200 bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2 w-full lg:w-auto">
-                    <div className="flex flex-col">
-                      <span className="font-semibold">Karaoke (music only)</span>
-                      <span className="text-[11px] text-slate-400">
-                        Strips center vocals when merging or exporting audio.
-                      </span>
-                    </div>
-                    <div className="relative">
-                      <input
-                        type="checkbox"
-                        className="sr-only peer"
-                        checked={karaokeMode}
-                        onChange={(e) => setKaraokeMode(e.target.checked)}
-                        disabled={playlistOutputMode === "zip"}
-                      />
-                      <div className={`w-11 h-6 rounded-full ${playlistOutputMode === "zip" ? "opacity-40" : ""} bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-pink-800 peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-pink-600`}></div>
-                    </div>
-                  </label>
-                </div>
+                
                 <button
                   onClick={handleDownloadPlaylist}
                   disabled={downloadState !== "idle" || !config.useServer}
@@ -1103,7 +1355,9 @@ function App() {
                           <Icons.MicOff className="w-5 h-5" />
                         </div>
                         <div>
-                          <div className="font-semibold text-white">Karaoke (music only)</div>
+                          <div className="font-semibold text-white">
+                            Karaoke (music only)
+                          </div>
                           <div className="text-xs text-slate-400">
                             Removes center vocals; requires MP4 output.
                           </div>
@@ -1115,9 +1369,15 @@ function App() {
                           className="sr-only peer"
                           checked={karaokeMode}
                           onChange={(e) => setKaraokeMode(e.target.checked)}
-                          disabled={false}
+                          disabled={convertToMp3}
                         />
-                        <div className={`w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600`}></div>
+                        <div
+                          className={`w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-indigo-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600 ${
+                            convertToMp3
+                              ? "opacity-60 cursor-not-allowed"
+                              : ""
+                          }`}
+                        ></div>
                       </label>
                     </div>
 
@@ -1127,16 +1387,57 @@ function App() {
                         <div className="flex items-center gap-2">
                           <Icons.FileVideo className="w-4 h-4 text-indigo-300" />
                           <span className="text-sm font-semibold text-white">
-                            Subtitles
+                            Extras bundle
                           </span>
                         </div>
                         <span className="text-[11px] text-slate-400">
-                          Embed when available
+                          Captions, chapters, cover
                         </span>
                       </div>
-                      <div className="text-xs text-slate-500">
-                        Subtitle selection is coming soon. Enable Server Mode to
-                        fetch caption tracks; we’ll add a picker here.
+                      <div className="flex flex-wrap gap-3 text-sm text-slate-200">
+                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={bundleExtras.subtitles}
+                            onChange={(e) =>
+                              setBundleExtras((prev) => ({
+                                ...prev,
+                                subtitles: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Subtitles</span>
+                        </label>
+                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={bundleExtras.chapters}
+                            onChange={(e) =>
+                              setBundleExtras((prev) => ({
+                                ...prev,
+                                chapters: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Chapters</span>
+                        </label>
+                        <label className="inline-flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={bundleExtras.thumbnail}
+                            onChange={(e) =>
+                              setBundleExtras((prev) => ({
+                                ...prev,
+                                thumbnail: e.target.checked,
+                              }))
+                            }
+                          />
+                          <span>Thumbnail</span>
+                        </label>
+                      </div>
+                      <div className="text-xs text-slate-500 mt-2">
+                        Preferences are saved locally; backend hooks for these
+                        are next up.
                       </div>
                     </div>
 
@@ -1146,6 +1447,23 @@ function App() {
                           ? "Downloads served from your local backend."
                           : "Powered by the built-in simulator."}
                       </div>
+                      {(() => {
+                        if (!videoInfo) return null;
+                        const activeFormats =
+                          selectedVideoFromPlaylist?.formats ||
+                          ("formats" in videoInfo ? videoInfo.formats : []);
+                        const sel = activeFormats?.find(
+                          (f) => f.format_id === selectedFormat
+                        );
+                        return (
+                          <div className="text-xs text-slate-300 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-1.5">
+                            Est. size:{" "}
+                            {convertToMp3
+                              ? "After conversion"
+                              : describeSize(sel)}
+                          </div>
+                        );
+                      })()}
 
                       <button
                         onClick={handleDownload}
@@ -1220,6 +1538,14 @@ function App() {
                             <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
                             {stats.speed}
                           </span>
+                          <span className="flex items-center gap-1.5 text-slate-400">
+                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
+                            {stats.totalBytes
+                              ? `${formatBytes(stats.downloadedBytes)} / ${formatBytes(stats.totalBytes)}`
+                              : stats.downloadedBytes
+                              ? `${formatBytes(stats.downloadedBytes)} downloaded`
+                              : '--'}
+                          </span>
                         </div>
                         <span className="text-slate-400">ETA: {stats.eta}</span>
                       </div>
@@ -1268,14 +1594,24 @@ function App() {
               ></div>
             </div>
             <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
-              <span>{stats.speed}</span>
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                {stats.speed}
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
+                {stats.totalBytes
+                  ? `${formatBytes(stats.downloadedBytes)} / ${formatBytes(stats.totalBytes)}`
+                  : stats.downloadedBytes
+                  ? `${formatBytes(stats.downloadedBytes)}`
+                  : '--'}
+              </span>
               <span>ETA {stats.eta}</span>
             </div>
           </div>
         </div>
       )}
 
-      
       {/* Footer Info */}
       <footer className="mt-10 border-t border-slate-800/70 bg-slate-950/80 backdrop-blur px-4">
         <div className="max-w-4xl mx-auto py-3 flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] text-slate-500">

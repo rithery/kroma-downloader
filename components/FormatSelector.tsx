@@ -143,6 +143,11 @@ const FormatItem: React.FC<{
               <span className={`px-2 py-0.5 rounded-full border ${sizeInfo.estimated ? 'border-dashed border-slate-600 text-slate-300' : 'border-slate-700 text-white'} bg-slate-900/60`}>
                 {sizeInfo.estimated ? `Est. ${sizeInfo.label}` : sizeInfo.label}
               </span>
+              {format.type === FormatType.AUDIO && format.tbr && (
+                <span className="px-2 py-0.5 rounded-full bg-slate-900/60 border border-slate-700 text-slate-200">
+                  {Math.round(format.tbr)} kbps
+                </span>
+              )}
               {format.type === FormatType.VIDEO && (
                 <span className={`px-2 py-0.5 rounded-full border bg-slate-900/60 ${hasAudio(format) ? 'border-emerald-700/60 text-emerald-200' : 'border-amber-700/60 text-amber-200'}`}>
                   {hasAudio(format) ? 'Video + Audio' : 'Video + best audio'}
