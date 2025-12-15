@@ -8,6 +8,7 @@ export interface VideoFormat {
   ext: string;
   resolution: string;
   filesize?: number;
+  filesize_approx?: number;
   note?: string; // e.g., "1080p60 HDR"
   type: FormatType;
   vcodec?: string;

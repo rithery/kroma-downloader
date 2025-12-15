@@ -143,7 +143,9 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
         
         const contentLengthHeader = response.headers.get('Content-Length');
         // If converting to MP3, the size changes, so we can't trust the original filesize
-        const contentLength = convertToMp3 ? 0 : (contentLengthHeader ? parseInt(contentLengthHeader, 10) : (expectedFileSize || 0));
+        const contentLength = convertToMp3
+            ? (expectedFileSize || 0)
+            : (contentLengthHeader ? parseInt(contentLengthHeader, 10) : (expectedFileSize || 0));
         
         const reader = response.body?.getReader();
         if (!reader) throw new Error("ReadableStream not supported by your browser");
@@ -152,6 +154,9 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
         const chunks: Uint8Array[] = [];
         const startTime = Date.now();
         let lastUpdate = startTime;
+
+        // Fire an initial progress event so the UI does not sit at 0%
+        onProgress({ progress: 0, speed: 'Starting...', eta: 'calculating...' });
 
         while(true) {
             const {done, value} = await reader.read();
@@ -162,7 +167,7 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
 
             const now = Date.now();
             // Update UI every 200ms
-            if (now - lastUpdate > 200) {
+            if (now - lastUpdate > 150) {
                 let progress = 0;
                 if (contentLength > 0) {
                     progress = (receivedLength / contentLength) * 100;
@@ -170,8 +175,8 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
                 } else {
                     // Indeterminate progress logic for streams (especially MP3 conversion)
                     const mb = receivedLength / (1024 * 1024);
-                    // Slower progress curve for indeterminate
-                    progress = Math.min(95, Math.log(mb + 1) * 10); 
+                    // Slower progress curve for indeterminate, cap lower if we have a rough size
+                    progress = Math.min(contentLength ? 98 : 95, Math.log(mb + 1) * 12); 
                 }
                 
                 // Calculate Speed

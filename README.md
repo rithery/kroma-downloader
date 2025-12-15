@@ -1,6 +1,6 @@
-# StreamGrab - Universal Video Downloader
+# ApsaraFlow - Khmer-Inspired Video Downloader
 
-A modern, high-performance web interface for `yt-dlp`.  
+A modern, Khmer-inspired web interface for `yt-dlp`.  
 Features video quality selection, high-res MP3 conversion, and AI-powered metadata analysis.
 
 ## 🚀 Installation Guide

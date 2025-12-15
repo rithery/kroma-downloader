@@ -1,5 +1,5 @@
 {
-  "name": "StreamGrab - yt-dlp GUI",
-  "description": "A modern, React-based frontend interface for a yt-dlp video downloader pipeline. Features video analysis, quality selection, and AI-powered metadata generation using Gemini.",
+  "name": "ApsaraFlow - yt-dlp GUI",
+  "description": "A modern, Khmer-inspired React interface for a yt-dlp video downloader pipeline. Features smooth flow controls, video analysis, quality selection, and AI-powered metadata generation using Gemini.",
   "requestFramePermissions": []
 }
