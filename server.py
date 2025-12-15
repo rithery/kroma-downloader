@@ -43,7 +43,13 @@ DOWNLOAD_GUARD = threading.BoundedSemaphore(value=3)
 DEFAULT_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"}
 
 
-def build_ydl_opts(temp_dir: str, format_id: str, convert_to_mp3: bool, allow_playlist: bool = False) -> Dict[str, Any]:
+def build_ydl_opts(
+    temp_dir: str,
+    format_id: str,
+    convert_to_mp3: bool,
+    allow_playlist: bool = False,
+    merge_output_format: Optional[str] = None,
+) -> Dict[str, Any]:
     """Configure yt-dlp options for metadata or download operations."""
     options: Dict[str, Any] = {
         "format": format_id,
@@ -55,6 +61,8 @@ def build_ydl_opts(temp_dir: str, format_id: str, convert_to_mp3: bool, allow_pl
         "nocheckcertificate": True,
         "http_headers": DEFAULT_HTTP_HEADERS,
     }
+    if merge_output_format:
+        options["merge_output_format"] = merge_output_format
 
     if convert_to_mp3:
         # Convert the downloaded file to a high-quality mp3 via ffmpeg
@@ -70,7 +78,7 @@ def build_ydl_opts(temp_dir: str, format_id: str, convert_to_mp3: bool, allow_pl
 
 
 def sanitize_filename(title: str, ext: str) -> str:
-    """Create a safe filename for Content-Disposition headers."""
+    """Create a safe, ASCII filename for Content-Disposition headers."""
     safe_title = (
         re.sub(r'[\\/*?:"<>|]', "", title)
         .replace("\n", " ")
@@ -78,7 +86,10 @@ def sanitize_filename(title: str, ext: str) -> str:
         .strip()
     )
     safe_title = safe_title or "download"
-    return f"{safe_title}.{ext}"
+    # Force ASCII to avoid latin-1 header encoding failures
+    safe_title_ascii = safe_title.encode("ascii", "ignore").decode("ascii").strip() or "download"
+    safe_ext_ascii = ext.encode("ascii", "ignore").decode("ascii") or ext
+    return f"{safe_title_ascii}.{safe_ext_ascii}"
 
 
 def build_filename(template: Optional[str], info: Dict[str, Any], ext: str) -> str:
@@ -251,13 +262,183 @@ async def download(
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 raise HTTPException(status_code=500, detail=str(exc))
 
-        # Single video/audio streaming path
+        # Single video/audio path
         formats = pre_info.get("formats") or []
+        # Support combined selectors like "137+bestaudio"
         selected_format = next((f for f in formats if f.get("format_id") == format), None)
-        ext = "mp3" if convert_to_mp3 else (selected_format.get("ext") if selected_format else "bin")
-        filename = build_filename(filename_template, {**pre_info, **(selected_format or {})}, ext)
+        base_format = selected_format
+        if selected_format is None and "+" in format:
+            base_id = format.split("+", 1)[0]
+            base_format = next((f for f in formats if f.get("format_id") == base_id), None)
 
-        content_type = "audio/mpeg" if convert_to_mp3 else "application/octet-stream"
+        if base_format is None and selected_format is None and "+" not in format:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Format '{format}' not available for this video. Refresh formats and pick another quality.",
+            )
+
+        ext = "mp3" if convert_to_mp3 else ((base_format or selected_format).get("ext") if (base_format or selected_format) else "bin")
+        filename = build_filename(filename_template, {**pre_info, **(base_format or selected_format or {})}, ext)
+
+        # If the selected format is video-only or requires merging (e.g., 1080p DASH),
+        # download to disk and let yt-dlp/ffmpeg handle muxing, then serve the file.
+        needs_merge = False
+        is_audio_only = False
+        if not convert_to_mp3:
+            if "+" in format:
+                needs_merge = True
+            elif base_format and base_format.get("vcodec") and (not base_format.get("acodec") or base_format.get("acodec") == "none"):
+                needs_merge = True
+            elif base_format and (not base_format.get("vcodec") or base_format.get("vcodec") == "none"):
+                is_audio_only = True
+
+        # MP3 conversion: use temp files so we can surface errors cleanly.
+        if convert_to_mp3:
+            temp_dir = tempfile.mkdtemp(prefix="apsaraflow_mp3_")
+            try:
+                ydl_opts = build_ydl_opts(temp_dir, format, False, allow_playlist=False)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+
+                requested = (info.get("requested_downloads") or [{}])[0]
+                source_path = requested.get("filepath") or requested.get("_filename")
+                if not source_path:
+                    source_path = os.path.join(
+                        temp_dir, f"{info.get('id')}.{requested.get('ext') or info.get('ext') or 'bin'}"
+                    )
+                if not os.path.exists(source_path):
+                    raise HTTPException(status_code=500, detail="Downloaded file missing before conversion.")
+
+                output_path = os.path.join(temp_dir, "output.mp3")
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    source_path,
+                    "-vn",
+                    "-acodec",
+                    "libmp3lame",
+                    "-b:a",
+                    "320k",
+                    output_path,
+                ]
+                try:
+                    ffmpeg_proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+                except FileNotFoundError as exc:
+                    raise HTTPException(status_code=500, detail="ffmpeg is required for MP3 conversion") from exc
+
+                if ffmpeg_proc.returncode != 0:
+                    err_msg = ffmpeg_proc.stderr.strip() or "FFmpeg failed to convert audio."
+                    raise HTTPException(status_code=500, detail=err_msg)
+
+                if not os.path.exists(output_path):
+                    raise HTTPException(status_code=500, detail="MP3 output not created.")
+
+                safe_name = sanitize_filename(filename if filename.endswith(".mp3") else f"{filename.rsplit('.',1)[0]}.mp3", "mp3")
+                background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+                return FileResponse(
+                    path=output_path,
+                    media_type="audio/mpeg",
+                    filename=safe_name,
+                    background=background,
+                )
+            except yt_dlp.utils.DownloadError as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=str(exc))
+            except HTTPException:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+            except Exception as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=500, detail=str(exc))
+
+        # Audio-only: download to file and return directly to avoid stdout issues with some HLS/DASH audio formats.
+        if is_audio_only:
+            temp_dir = tempfile.mkdtemp(prefix="apsaraflow_audio_")
+            try:
+                ydl_opts = build_ydl_opts(temp_dir, format, False, allow_playlist=False)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+
+                requested = (info.get("requested_downloads") or [{}])[0]
+                output_path = requested.get("filepath") or requested.get("_filename")
+                if not output_path:
+                    output_path = os.path.join(
+                        temp_dir, f"{info.get('id')}.{requested.get('ext') or info.get('ext') or 'webm'}"
+                    )
+                if not os.path.exists(output_path):
+                    raise HTTPException(status_code=500, detail="Audio file was not created.")
+
+                media_type = "audio/webm"
+                guessed_ext = os.path.splitext(output_path)[1].lstrip(".") or "webm"
+                if guessed_ext.lower() in ("m4a", "mp4", "m4v"):
+                    media_type = "audio/mp4"
+                download_name = filename
+                if not download_name.lower().endswith(f".{guessed_ext.lower()}"):
+                    download_name = f"{download_name.rsplit('.', 1)[0]}.{guessed_ext}"
+
+                safe_name = sanitize_filename(filename, guessed_ext)
+                background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+                return FileResponse(
+                    path=output_path,
+                    media_type=media_type,
+                    filename=safe_name,
+                    background=background,
+                )
+            except yt_dlp.utils.DownloadError as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=str(exc))
+            except HTTPException:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+            except Exception as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=500, detail=str(exc))
+
+        if needs_merge:
+            temp_dir = tempfile.mkdtemp(prefix="apsaraflow_mux_")
+            try:
+                ydl_opts = build_ydl_opts(temp_dir, format, False, allow_playlist=False, merge_output_format="mp4")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+
+                requested = (info.get("requested_downloads") or [{}])[0]
+                output_path = requested.get("filepath") or requested.get("_filename")
+                if not output_path:
+                    output_path = os.path.join(
+                        temp_dir, f"{info.get('id')}.{requested.get('ext') or info.get('ext') or 'mp4'}"
+                    )
+                if not os.path.exists(output_path):
+                    # yt-dlp may place merged file at the root with merge_output_format
+                    merged_guess = os.path.join(temp_dir, f"{info.get('id')}.mp4")
+                    if os.path.exists(merged_guess):
+                        output_path = merged_guess
+                if not os.path.exists(output_path):
+                    raise HTTPException(status_code=500, detail="Muxed video was not created.")
+
+                safe_name = sanitize_filename(
+                    filename if filename.endswith(".mp4") else f"{filename.rsplit('.', 1)[0]}.mp4",
+                    "mp4",
+                )
+                background = BackgroundTask(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+                return FileResponse(
+                    path=output_path,
+                    media_type="video/mp4",
+                    filename=safe_name,
+                    background=background,
+                )
+            except yt_dlp.utils.DownloadError as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=400, detail=str(exc))
+            except HTTPException:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+            except Exception as exc:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise HTTPException(status_code=500, detail=str(exc))
+
+        # Streaming path (no conversion)
+        content_type = "application/octet-stream"
         content_length = None
         if selected_format:
             content_length = selected_format.get("filesize") or selected_format.get("filesize_approx")
@@ -274,9 +455,6 @@ async def download(
             url,
         ]
 
-        if convert_to_mp3:
-            cmd.extend(["-x", "--audio-format", "mp3", "--audio-quality", "0"])
-
         try:
             yt_process = subprocess.Popen(
                 cmd,
@@ -290,58 +468,26 @@ async def download(
         stream_process = yt_process
         cleanup_processes = [yt_process]
 
-        # Optional MP3 conversion via ffmpeg (embed metadata/cover when possible)
-        if convert_to_mp3:
-            cover_path = download_thumbnail(pre_info.get("thumbnail"))
-            metadata_args = [
-                "-metadata",
-                f"title={pre_info.get('title') or pre_info.get('id') or ''}",
-                "-metadata",
-                f"artist={pre_info.get('uploader') or pre_info.get('uploader_id') or ''}",
-                "-metadata",
-                f"comment={pre_info.get('webpage_url') or url}",
-                "-id3v2_version",
-                "3",
-            ]
-            ffmpeg_inputs = ["-i", "pipe:0"]
-            ffmpeg_maps = ["-map", "0:a"]
+        # Drain stderr to avoid deadlock and capture errors.
+        stderr_lines: list[str] = []
 
-            if cover_path:
-                ffmpeg_inputs.extend(["-i", cover_path])
-                ffmpeg_maps.extend(["-map", "1:v", "-disposition:v", "attached_pic"])
-
-            ffmpeg_cmd = [
-                "ffmpeg",
-                *ffmpeg_inputs,
-                "-vn",
-                "-acodec",
-                "libmp3lame",
-                "-b:a",
-                "320k",
-                *metadata_args,
-                *ffmpeg_maps,
-                "-f",
-                "mp3",
-                "pipe:1",
-            ]
+        def _drain_stderr():
             try:
-                ffmpeg_process = subprocess.Popen(
-                    ffmpeg_cmd,
-                    stdin=yt_process.stdout,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    bufsize=0,
-                )
-            except FileNotFoundError as exc:
-                yt_process.kill()
-                raise HTTPException(status_code=500, detail="ffmpeg is required for MP3 conversion") from exc
+                if yt_process.stderr:
+                    for line in iter(yt_process.stderr.readline, b""):
+                        if not line:
+                            break
+                        text = line.decode("utf-8", "ignore").strip()
+                        if text:
+                            stderr_lines.append(text)
+                        # Keep only the last few lines to include in errors
+                        if len(stderr_lines) > 20:
+                            stderr_lines.pop(0)
+            except Exception:
+                pass
 
-            stream_process = ffmpeg_process
-            cleanup_processes.append(ffmpeg_process)
-
-            # Allow yt-dlp to receive SIGPIPE if ffmpeg exits
-            if yt_process.stdout:
-                yt_process.stdout.close()
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
 
         def stream_output():
             try:
@@ -359,8 +505,10 @@ async def download(
 
                 for proc in cleanup_processes:
                     if proc.returncode not in (0, None):
-                        print(f"[yt-dlp] process exited with code {proc.returncode}")
-                        break
+                        stderr_thread.join(timeout=1)
+                        detail = "\n".join(stderr_lines[-6:]).strip() or f"yt-dlp exited with code {proc.returncode}"
+                        print(f"[yt-dlp stderr] {detail}")  # surface server-side for debugging
+                        raise HTTPException(status_code=500, detail=detail)
             finally:
                 for proc in cleanup_processes:
                     if proc.poll() is None:
@@ -375,14 +523,9 @@ async def download(
                             proc.stderr.close()
                     except Exception:
                         pass
-                try:
-                    if convert_to_mp3 and cover_path:
-                        os.remove(cover_path)
-                except Exception:
-                    pass
 
         headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": f'attachment; filename="{sanitize_filename(filename, ext)}"',
         }
         if content_length:
             headers["Content-Length"] = str(content_length)

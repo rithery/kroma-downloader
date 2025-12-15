@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Icons } from './constants';
 import { Logo } from './components/Logo';
 import { VideoInfo, PlaylistInfo, MediaInfo, FormatType, VideoFormat } from './types';
@@ -7,23 +7,42 @@ import { VideoCard } from './components/VideoCard';
 import { FormatSelector } from './components/FormatSelector';
 import { PlaylistCard } from './components/PlaylistCard';
 
+const parseHeight = (format: VideoFormat): number => {
+  const res = format.resolution?.toLowerCase() || '';
+  const pMatch = res.match(/(\d{3,4})p/);
+  if (pMatch) return parseInt(pMatch[1], 10);
+  const xMatch = res.match(/x(\d{3,4})/);
+  if (xMatch) return parseInt(xMatch[1], 10);
+  return 0;
+};
+
 const findRecommendedFormat = (formats: VideoFormat[]): string | null => {
   if (!formats?.length) return null;
 
-  const videoWithAudio = formats
-    .filter(f => f.type === FormatType.VIDEO && f.acodec && f.acodec !== 'none')
-    .sort((a, b) => {
-      const resA = parseInt(a.resolution) || 0;
-      const resB = parseInt(b.resolution) || 0;
-      if (resA !== resB) return resB - resA;
-      return (b.filesize || 0) - (a.filesize || 0);
+  // Prefer the highest resolution video; if it's video-only we'll auto-merge best audio.
+  const videos = formats.filter(f => f.type === FormatType.VIDEO);
+  if (videos.length) {
+    const sorted = [...videos].sort((a, b) => {
+      const heightDiff = parseHeight(b) - parseHeight(a);
+      if (heightDiff !== 0) return heightDiff;
+      const audioScoreA = a.acodec && a.acodec !== 'none' ? 1 : 0;
+      const audioScoreB = b.acodec && b.acodec !== 'none' ? 1 : 0;
+      if (audioScoreA !== audioScoreB) return audioScoreB - audioScoreA;
+      const sizeA = a.filesize ?? a.filesize_approx ?? 0;
+      const sizeB = b.filesize ?? b.filesize_approx ?? 0;
+      return sizeB - sizeA;
     });
+    return sorted[0]?.format_id || null;
+  }
 
-  if (videoWithAudio.length) return videoWithAudio[0].format_id;
-
+  // Fallback to best audio-only if no video streams
   const audioFormats = formats
     .filter(f => f.type === FormatType.AUDIO)
-    .sort((a, b) => (b.filesize || 0) - (a.filesize || 0));
+    .sort((a, b) => {
+      const sizeA = a.filesize ?? a.filesize_approx ?? 0;
+      const sizeB = b.filesize ?? b.filesize_approx ?? 0;
+      return sizeB - sizeA;
+    });
 
   if (audioFormats.length) return audioFormats[0].format_id;
 
@@ -74,7 +93,96 @@ const AppStatus = {
   BUSY: 'BUSY',
 } as const;
 
+const SUPPORTED_SITES = [
+  { name: 'YouTube', patterns: ['youtube.com', 'youtu.be'] },
+  { name: 'TikTok', patterns: ['tiktok.com'] },
+  { name: 'Vimeo', patterns: ['vimeo.com'] },
+  { name: 'Twitter / X', patterns: ['twitter.com', 'x.com'] },
+  { name: 'Instagram', patterns: ['instagram.com'] },
+  { name: 'Reddit', patterns: ['reddit.com'] },
+  { name: 'Facebook', patterns: ['facebook.com', 'fb.watch'] },
+];
+
+type UrlInsight =
+  | { state: 'idle'; message: '' }
+  | { state: 'valid' | 'warn' | 'invalid'; message: string; matchedSite?: string };
+
+const analyzeUrl = (raw: string): UrlInsight => {
+  const value = raw.trim();
+  if (!value) return { state: 'idle', message: '' };
+
+  const normalized = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+  let host = '';
+  try {
+    const parsed = new URL(normalized);
+    host = parsed.hostname.toLowerCase();
+  } catch {
+    return {
+      state: 'invalid',
+      message: 'Enter a full link, e.g. https://youtube.com/watch?...',
+    };
+  }
+
+  const matched = SUPPORTED_SITES.find((site) =>
+    site.patterns.some((p) => host.includes(p))
+  );
+
+  if (matched) {
+    const isPlaylist = /list=/.test(normalized) || /\/playlist/.test(normalized);
+    return {
+      state: 'valid',
+      message: `${matched.name} link${isPlaylist ? ' (playlist detected)' : ''}`,
+      matchedSite: matched.name,
+    };
+  }
+
+  return {
+    state: 'warn',
+    message: 'May be unsupported. Works best with YouTube, TikTok, Vimeo, X, Instagram, Reddit.',
+  };
+};
+
 const safeTrim = (val?: string | null) => (typeof val === 'string' ? val.trim() : '');
+
+const pickBestAudioFormat = (formats: VideoFormat[]): VideoFormat | undefined => {
+  return [...formats]
+    .filter(f => f.type === FormatType.AUDIO || (!f.vcodec || f.vcodec === 'none'))
+    .filter(f => f.acodec && f.acodec !== 'none')
+    .sort((a, b) => {
+      const sizeA = a.filesize ?? a.filesize_approx ?? 0;
+      const sizeB = b.filesize ?? b.filesize_approx ?? 0;
+      if (sizeA !== sizeB) return sizeB - sizeA;
+      const brA = a.tbr ?? 0;
+      const brB = b.tbr ?? 0;
+      return brB - brA;
+    })[0];
+};
+
+const buildFormatString = (
+  formats: VideoFormat[],
+  selectedFormatId: string,
+  convertToMp3: boolean
+): string => {
+  const selected = formats.find(f => f.format_id === selectedFormatId);
+  if (!selected) return selectedFormatId;
+
+  // For MP3 conversion, prefer the best audio format regardless of current selection.
+  if (convertToMp3) {
+    if (selected.type === FormatType.AUDIO && selected.acodec && selected.acodec !== 'none') {
+      return selected.format_id;
+    }
+    const bestAudio = pickBestAudioFormat(formats);
+    return bestAudio ? bestAudio.format_id : 'bestaudio';
+  }
+
+  // If the chosen format already has audio, use as-is.
+  if (selected.acodec && selected.acodec !== 'none') return selected.format_id;
+
+  // If video-only, append the best audio stream for a merged result.
+  const bestAudio = pickBestAudioFormat(formats);
+  if (bestAudio) return `${selected.format_id}+${bestAudio.format_id}`;
+  return `${selected.format_id}+bestaudio`;
+};
 
 function App() {
   // State
@@ -95,6 +203,9 @@ function App() {
   const [downloadLogs, setDownloadLogs] = useState<string[]>([]);
   const lastLoggedPercent = useRef(0);
   const heroStatus = downloadState === 'idle' ? AppStatus.IDLE : AppStatus.BUSY;
+  const [clipboardSuggestion, setClipboardSuggestion] = useState<string | null>(null);
+  const [clipboardError, setClipboardError] = useState<string | null>(null);
+  const [urlInsight, setUrlInsight] = useState<UrlInsight>({ state: 'idle', message: '' });
 
   // Settings State
   const [showSettings, setShowSettings] = useState(false);
@@ -107,6 +218,43 @@ function App() {
       return updated;
     });
   };
+
+  // Light clipboard watcher to surface a "paste" suggestion when empty.
+  useEffect(() => {
+    let cancelled = false;
+    const peekClipboard = async () => {
+      if (url.trim()) return;
+      if (!navigator?.clipboard?.readText) return;
+      try {
+        const text = (await navigator.clipboard.readText())?.trim();
+        if (cancelled) return;
+        if (!text) {
+          setClipboardSuggestion(null);
+          return;
+        }
+        const insight = analyzeUrl(text);
+        if (insight.state === 'valid' || insight.state === 'warn') {
+          setClipboardSuggestion(text);
+        } else {
+          setClipboardSuggestion(null);
+        }
+      } catch {
+        // ignore passive failures; surfaced on explicit paste attempt
+      }
+    };
+
+    peekClipboard();
+    const handleFocus = () => peekClipboard();
+    window.addEventListener('focus', handleFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [url]);
+
+  useEffect(() => {
+    setUrlInsight(analyzeUrl(url));
+  }, [url]);
 
   // Handlers
   const handleVideoSelectFromPlaylist = (video: VideoInfo) => {
@@ -155,6 +303,33 @@ function App() {
     }
   };
 
+  const handlePasteFromClipboard = async (preferredValue?: string) => {
+    setClipboardError(null);
+    if (preferredValue) {
+      setUrl(preferredValue);
+      return;
+    }
+    if (!navigator?.clipboard?.readText) {
+      setClipboardError('Clipboard not available here. Use Cmd/Ctrl + V.');
+      return;
+    }
+    try {
+      const text = (await navigator.clipboard.readText())?.trim();
+      if (!text) {
+        setClipboardError('Clipboard is empty.');
+        return;
+      }
+      setUrl(text);
+      setClipboardSuggestion(null);
+    } catch (err: any) {
+      setClipboardError(
+        err?.message?.toLowerCase().includes('denied')
+          ? 'Clipboard blocked by the browser. Click into the page and try again.'
+          : 'Could not read clipboard. Use Cmd/Ctrl + V instead.'
+      );
+    }
+  };
+
   const handleDownload = async () => {
     if (!selectedFormat) return;
     setDownloadState('downloading');
@@ -169,12 +344,17 @@ function App() {
 
     // Find the filesize if available for better progress bar
     const selectedFormatObj = currentVideoInfo.formats.find(f => f.format_id === selectedFormat);
+    const formatForRequest = buildFormatString(
+      currentVideoInfo.formats,
+      selectedFormat,
+      convertToMp3
+    );
     const expectedSize = selectedFormatObj?.filesize;
 
     try {
         const downloadTargetUrl = selectedVideoFromPlaylist ? selectedVideoFromPlaylist.webpage_url : url;
         const blob = await simulateDownload(
-            selectedFormat, 
+            formatForRequest, 
             downloadTargetUrl, 
             (data: DownloadProgress) => {
                 setProgress(data.progress);
@@ -565,6 +745,50 @@ function App() {
               )}
             </button>
           </form>
+
+          <div className="mt-3 flex flex-col gap-2 items-center">
+            <div className="flex flex-wrap justify-center gap-2">
+              <button
+                type="button"
+                onClick={() => handlePasteFromClipboard()}
+                className="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-900/70 text-xs text-slate-200 hover:border-indigo-500/60 hover:text-white transition-colors"
+              >
+                Paste from clipboard
+              </button>
+              {clipboardSuggestion && !url && (
+                <button
+                  type="button"
+                  onClick={() => handlePasteFromClipboard(clipboardSuggestion)}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600/80 hover:bg-emerald-500 text-white text-xs border border-emerald-700/50 transition-colors"
+                >
+                  Use detected link
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap justify-center gap-2 text-[11px] text-slate-400">
+              <span className="px-3 py-1 rounded-full bg-white/5 border border-white/10">
+                Supported: {SUPPORTED_SITES.map((s) => s.name).join(' • ')}
+              </span>
+              {urlInsight.state !== 'idle' && (
+                <span
+                  className={`px-3 py-1 rounded-full border ${
+                    urlInsight.state === 'valid'
+                      ? 'border-emerald-700 bg-emerald-900/30 text-emerald-200'
+                      : urlInsight.state === 'warn'
+                      ? 'border-amber-700 bg-amber-900/30 text-amber-200'
+                      : 'border-red-800 bg-red-950/40 text-red-300'
+                  }`}
+                >
+                  {urlInsight.message}
+                </span>
+              )}
+              {clipboardError && (
+                <span className="px-3 py-1 rounded-full border border-red-900 bg-red-950/40 text-red-300">
+                  {clipboardError}
+                </span>
+              )}
+            </div>
+          </div>
 
           {error && (
             <div

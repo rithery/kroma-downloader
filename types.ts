@@ -13,6 +13,8 @@ export interface VideoFormat {
   type: FormatType;
   vcodec?: string;
   acodec?: string;
+  tbr?: number; // total bitrate (from yt-dlp, if provided)
+  filesize_approx?: number;
 }
 
 export interface VideoInfo {

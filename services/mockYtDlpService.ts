@@ -85,16 +85,18 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
           formats: (v.formats || []).map((f: any) => ({
             format_id: f.format_id,
             ext: f.ext,
-            resolution: f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : 'audio only'),
-            note: f.format_note,
-            type: (f.vcodec === 'none' || !f.vcodec) && f.acodec !== 'none' ? FormatType.AUDIO : FormatType.VIDEO,
-            filesize: f.filesize || f.filesize_approx,
-            vcodec: f.vcodec,
-            acodec: f.acodec
-          })).filter((f: any) => f.format_id)
-        }))
-      } as PlaylistInfo;
-    }
+          resolution: f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : 'audio only'),
+          note: f.format_note,
+          type: (f.vcodec === 'none' || !f.vcodec) && f.acodec !== 'none' ? FormatType.AUDIO : FormatType.VIDEO,
+          filesize: f.filesize,
+          filesize_approx: f.filesize_approx,
+          vcodec: f.vcodec,
+          acodec: f.acodec,
+          tbr: f.tbr
+        })).filter((f: any) => f.format_id)
+      }))
+    } as PlaylistInfo;
+  }
     
     // Transform backend data to our frontend VideoInfo interface
     return {
@@ -109,14 +111,16 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
       formats: (data.formats || []).map((f: any) => ({
         format_id: f.format_id,
         ext: f.ext,
-        resolution: f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : 'audio only'),
-        note: f.format_note,
-        type: (f.vcodec === 'none' || !f.vcodec) && f.acodec !== 'none' ? FormatType.AUDIO : FormatType.VIDEO,
-        filesize: f.filesize || f.filesize_approx,
-        vcodec: f.vcodec,
-        acodec: f.acodec
-      })).filter((f: any) => f.format_id) // ensure valid formats
-    } as VideoInfo;
+      resolution: f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : 'audio only'),
+      note: f.format_note,
+      type: (f.vcodec === 'none' || !f.vcodec) && f.acodec !== 'none' ? FormatType.AUDIO : FormatType.VIDEO,
+      filesize: f.filesize,
+      filesize_approx: f.filesize_approx,
+      vcodec: f.vcodec,
+      acodec: f.acodec,
+      tbr: f.tbr
+    })).filter((f: any) => f.format_id) // ensure valid formats
+  } as VideoInfo;
   } catch (error: any) {
     console.error("Real API Error Details:", error);
     
@@ -148,7 +152,21 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
     
     try {
         const response = await fetch(endpoint);
-        if (!response.ok) throw new Error(`Download failed: ${response.statusText}`);
+        if (!response.ok) {
+            let errorMessage = `Download failed: ${response.status} ${response.statusText}`;
+            try {
+                const errJson = await response.json();
+                if (errJson?.detail) errorMessage = `Download failed: ${errJson.detail}`;
+            } catch {
+                try {
+                    const errText = await response.text();
+                    if (errText) errorMessage = `Download failed: ${errText}`;
+                } catch {
+                    // ignore
+                }
+            }
+            throw new Error(errorMessage);
+        }
         
         const contentLengthHeader = response.headers.get('Content-Length');
         // If converting to MP3, the size changes, so we can't trust the original filesize

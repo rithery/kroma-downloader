@@ -145,9 +145,14 @@ const FormatItem: React.FC<{
               </span>
               {format.type === FormatType.VIDEO && (
                 <span className={`px-2 py-0.5 rounded-full border bg-slate-900/60 ${hasAudio(format) ? 'border-emerald-700/60 text-emerald-200' : 'border-amber-700/60 text-amber-200'}`}>
-                  {hasAudio(format) ? 'Video + Audio' : 'Video only'}
+                  {hasAudio(format) ? 'Video + Audio' : 'Video + best audio'}
                 </span>
               )}
+            </div>
+          )}
+          {format && format.type === FormatType.VIDEO && !hasAudio(format) && (
+            <div className="text-[11px] text-amber-100/80">
+              Missing audio track? We will auto-merge the best available audio stream.
             </div>
           )}
         </div>
