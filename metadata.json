@@ -1,0 +1,5 @@
+{
+  "name": "StreamGrab - yt-dlp GUI",
+  "description": "A modern, React-based frontend interface for a yt-dlp video downloader pipeline. Features video analysis, quality selection, and AI-powered metadata generation using Gemini.",
+  "requestFramePermissions": []
+}
