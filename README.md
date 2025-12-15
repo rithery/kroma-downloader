@@ -28,10 +28,10 @@ Open a new terminal window:
 
 ```bash
 # Install Node dependencies
-npm install
+yarn install
 
 # Start the development server
-npm run dev
+yarn dev
 ```
 
 ## 🛠 Features
