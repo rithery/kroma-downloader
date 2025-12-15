@@ -1,5 +1,6 @@
 import React, { useRef, useState } from 'react';
 import { Icons } from './constants';
+import { Logo } from './components/Logo';
 import { VideoInfo, PlaylistInfo, MediaInfo, FormatType, VideoFormat } from './types';
 import { fetchVideoInfo, simulateDownload, DownloadProgress, updateApiConfig, getApiConfig } from './services/mockYtDlpService';
 import { VideoCard } from './components/VideoCard';
@@ -29,6 +30,52 @@ const findRecommendedFormat = (formats: VideoFormat[]): string | null => {
   return formats[0].format_id;
 };
 
+const formatFilename = (
+  template: string | undefined,
+  info: { title?: string; uploader?: string; resolution?: string; formatId?: string; id?: string },
+  fallback: string,
+  ext: string
+) => {
+  const baseTemplate = template?.trim() || '{title}';
+  const safeExt = ext.startsWith('.') ? ext.slice(1) : ext;
+  const replacements: Record<string, string> = {
+    title: info.title || fallback,
+    uploader: info.uploader || 'uploader',
+    resolution: info.resolution || 'best',
+    format: info.formatId || 'format',
+    id: info.id || 'id',
+    ext: safeExt,
+  };
+
+  let name = baseTemplate;
+  Object.entries(replacements).forEach(([key, value]) => {
+    const regex = new RegExp(`{${key}}`, 'gi');
+    name = name.replace(regex, value);
+  });
+
+  // Keep unicode, spaces, dashes; strip only characters disallowed by common filesystems
+  name = name
+    .replace(/[\\/*?:"<>|]/g, '')
+    .replace(/[\u0000-\u001F]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!name) name = fallback;
+
+  if (!name.toLowerCase().endsWith(`.${safeExt.toLowerCase()}`)) {
+    return `${name}.${safeExt}`;
+  }
+  return name;
+};
+
+const SETTINGS_ENABLED = false;
+const AppStatus = {
+  IDLE: 'IDLE',
+  BUSY: 'BUSY',
+} as const;
+
+const safeTrim = (val?: string | null) => (typeof val === 'string' ? val.trim() : '');
+
 function App() {
   // State
   const [url, setUrl] = useState('');
@@ -47,6 +94,7 @@ function App() {
   const [stats, setStats] = useState<{ speed: string; eta: string }>({ speed: '--', eta: '--' });
   const [downloadLogs, setDownloadLogs] = useState<string[]>([]);
   const lastLoggedPercent = useRef(0);
+  const heroStatus = downloadState === 'idle' ? AppStatus.IDLE : AppStatus.BUSY;
 
   // Settings State
   const [showSettings, setShowSettings] = useState(false);
@@ -109,7 +157,6 @@ function App() {
 
   const handleDownload = async () => {
     if (!selectedFormat) return;
-    
     setDownloadState('downloading');
     setDownloadLogs([]);
     lastLoggedPercent.current = 0;
@@ -148,9 +195,20 @@ function App() {
         link.href = blobUrl;
         
         const ext = convertToMp3 ? 'mp3' : (selectedFormatObj?.ext || 'mp4');
-        const titleSource = customTitle.trim() || currentVideoInfo.title;
-        const sanitizedTitle = titleSource.replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'video';
-        link.download = `${sanitizedTitle}.${ext}`;
+        const titleSource = safeTrim(customTitle) || currentVideoInfo.title;
+        const downloadName = formatFilename(
+          config.filenameTemplate,
+          {
+            title: titleSource,
+            uploader: currentVideoInfo.uploader,
+            resolution: selectedFormatObj?.resolution,
+            formatId: selectedFormatObj?.format_id,
+            id: currentVideoInfo.id,
+          },
+          'video',
+          ext
+        );
+        link.download = downloadName;
         
         document.body.appendChild(link);
         link.click();
@@ -183,7 +241,7 @@ function App() {
     setStats({ speed: 'Starting...', eta: 'Calculating...' });
 
     try {
-      const playlistTitle = customTitle.trim() || videoInfo.title || 'playlist';
+      const playlistTitle = safeTrim(customTitle) || videoInfo.title || 'playlist';
       const blob = await simulateDownload(
         playlistMode === 'audio' ? 'bestaudio' : 'best',
         url,
@@ -202,9 +260,21 @@ function App() {
 
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      const sanitizedTitle = playlistTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase() || 'playlist';
+      const ext = playlistMode === 'audio' ? 'mp3_bundle.zip' : 'video_bundle.zip';
+      const downloadName = formatFilename(
+        config.filenameTemplate,
+        {
+          title: playlistTitle,
+          uploader: videoInfo.uploader,
+          resolution: playlistMode === 'audio' ? 'audio' : 'video',
+          formatId: playlistMode === 'audio' ? 'bestaudio' : 'best',
+          id: videoInfo.id,
+        },
+        'playlist',
+        ext
+      );
       link.href = blobUrl;
-      link.download = `${sanitizedTitle}.${playlistMode === 'audio' ? 'mp3_bundle.zip' : 'video_bundle.zip'}`;
+      link.download = downloadName;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -296,9 +366,14 @@ function App() {
   const isServerConnectionError = error?.includes("Could not connect to backend");
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 pb-2 relative flex flex-col">
+    <div className="min-h-screen bg-[#060815] text-slate-200 pb-2 relative flex flex-col">
+      {/* Digital Weave Background */}
+      <div className="pointer-events-none absolute inset-0 opacity-40">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_10%_20%,rgba(224,0,37,0.14),transparent_35%),radial-gradient(circle_at_90%_10%,rgba(3,46,161,0.18),transparent_40%),radial-gradient(circle_at_50%_80%,rgba(224,0,37,0.12),transparent_35%)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.04)_1px,transparent_1px)] bg-[size:28px_28px]" />
+      </div>
       {/* Settings Modal */}
-      {showSettings && (
+      {SETTINGS_ENABLED && showSettings && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-6 shadow-2xl">
             <div className="flex justify-between items-center mb-6">
@@ -357,6 +432,25 @@ function App() {
                   </p>
                 </div>
               )}
+
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-slate-300">
+                  Filename template
+                </label>
+                <input
+                  type="text"
+                  value={config.filenameTemplate || "{title}"}
+                  onChange={(e) =>
+                    handleConfigChange({ filenameTemplate: e.target.value })
+                  }
+                  placeholder="{title}-{uploader}-{resolution}"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 text-sm font-mono"
+                />
+                <p className="text-xs text-slate-500">
+                  Tokens: {"{title}"}, {"{uploader}"}, {"{resolution}"},{" "}
+                  {"{format}"}. We sanitize unsafe characters automatically.
+                </p>
+              </div>
             </div>
 
             <div className="mt-8 flex justify-end">
@@ -396,36 +490,25 @@ function App() {
       <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-md sticky top-12 z-40">
         <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div
-              className={`relative w-10 h-10 rounded-xl overflow-hidden border border-slate-700 shadow-lg shadow-emerald-900/30 ${
-                config.useServer
-                  ? "bg-gradient-to-br from-emerald-500 via-cyan-500 to-indigo-500"
-                  : "bg-gradient-to-br from-slate-700 via-slate-600 to-slate-500"
-              }`}
-            >
-              <div className="absolute inset-0 opacity-70 bg-[radial-gradient(circle_at_30%_30%,rgba(255,255,255,0.4),transparent_45%)]" />
-              <div className="absolute inset-0 flex items-center justify-center text-white font-black tracking-tight text-lg drop-shadow-sm">
-                AF
-              </div>
+            <div className="relative w-12 h-12 rounded-xl overflow-hidden border border-slate-700 shadow-lg shadow-emerald-900/30 bg-slate-900/80 flex items-center justify-center">
+              <Logo className="w-10 h-10" />
             </div>
             <div className="flex flex-col leading-tight">
               <h1 className="font-bold text-xl tracking-tight text-white">
-                ApsaraFlow
+                KROMA
               </h1>
               <span className="text-[11px] uppercase tracking-[0.18em] text-slate-500"></span>
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <div className="hidden sm:block text-xs font-mono text-slate-400 border border-slate-800 px-2 py-1 rounded">
-              Build 2024.10
+            <div className="hidden sm:block text-xs font-mono text-slate-200 border border-[#e00025]/30 px-2 py-1 rounded bg-[#e00025]/10">
+              Build 2025.15
             </div>
-            <button
-              onClick={() => setShowSettings(true)}
-              className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-all"
-              title="Settings"
-            >
-              <Icons.Settings className="w-5 h-5" />
-            </button>
+            {!SETTINGS_ENABLED && (
+              <span className="text-[11px] text-slate-200 px-2 py-1 border border-[#032ea1]/40 rounded-lg bg-[#032ea1]/10">
+                Settings disabled
+              </span>
+            )}
           </div>
         </div>
       </header>
@@ -433,20 +516,27 @@ function App() {
       <main className="max-w-4xl mx-auto px-4 pt-10 flex-1 w-full">
         {/* URL Input Section */}
         <section className="mb-10 text-center">
-          <h2 className="text-3xl md:text-4xl font-bold text-white mb-4">
-            Universal Video Downloader
-          </h2>
-          <p className="text-slate-400 mb-8 max-w-lg mx-auto">
-            Drop any YouTube link and ApsaraFlow will read the stream, surface
-            clean presets, and deliver the file you need—powered by{" "}
-            {config.useServer ? (
-              <span className="text-green-400 font-mono mx-1">real yt-dlp</span>
-            ) : (
-              <span className="text-indigo-400 font-mono mx-1">
-                our fast simulator
+          <div
+            className={`text-center mb-2 z-10 space-y-6 transition-all duration-700 ${
+              heroStatus === AppStatus.IDLE
+                ? "scale-100 opacity-100"
+                : "scale-95 opacity-80"
+            }`}
+          >
+            <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-slate-900/80 border border-slate-700/50 backdrop-blur-md">
+              <Icons.Layers className="w-3.5 h-3.5 text-red-500" />
+              <span className="text-xs font-bold tracking-widest text-slate-300 uppercase">
+                ទាញយកវីដេអូ Youtube
               </span>
-            )}
-            .
+            </div>
+            <h1 className="text-6xl md:text-9xl font-extrabold tracking-tighter text-transparent bg-clip-text bg-gradient-to-br from-white via-slate-200 to-slate-500 drop-shadow-2xl">
+              KROMA
+            </h1>
+          </div>
+          <p className="text-slate-300 mb-8 max-w-lg mx-auto leading-relaxed">
+            Drop any link and KROMA slices the stream, surfaces smart presets, and
+            ships the exact file you want—powered by{" "}
+            <span className="text-green-400 font-mono mx-1">yt-dlp</span>.
           </p>
 
           <form
@@ -471,7 +561,7 @@ function App() {
               {loading ? (
                 <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
               ) : (
-                "Fetch info"
+                "ស្វែងរក"
               )}
             </button>
           </form>
@@ -638,6 +728,45 @@ function App() {
                         <span className="text-xs text-slate-500 mt-1">
                           Auto-filled from the source—tweak it or keep as-is.
                         </span>
+                        {(() => {
+                          if (!videoInfo) return null;
+                          const activeFormats =
+                            selectedVideoFromPlaylist?.formats ||
+                            ("formats" in videoInfo ? videoInfo.formats : []);
+                          const sel = activeFormats?.find(
+                            (f) => f.format_id === selectedFormat
+                          );
+                          const titleSource =
+                            safeTrim(customTitle) ||
+                            selectedVideoFromPlaylist?.title ||
+                            ("title" in videoInfo ? videoInfo.title : "");
+                          const preview = formatFilename(
+                            config.filenameTemplate,
+                            {
+                              title: titleSource,
+                              uploader:
+                                selectedVideoFromPlaylist?.uploader ||
+                                ("uploader" in videoInfo
+                                  ? videoInfo.uploader
+                                  : undefined),
+                              resolution: sel?.resolution,
+                              formatId: sel?.format_id,
+                              id:
+                                selectedVideoFromPlaylist?.id ||
+                                ("id" in videoInfo ? videoInfo.id : undefined),
+                            },
+                            "download",
+                            convertToMp3 ? "mp3" : sel?.ext || "mp4"
+                          );
+                          return (
+                            <div className="mt-2 inline-flex items-center gap-2 text-[11px] text-slate-400 bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-1.5">
+                              <span className="text-slate-500">Preview:</span>
+                              <span className="font-mono text-slate-200">
+                                {preview}
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -669,6 +798,25 @@ function App() {
                         />
                         <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-pink-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-pink-600"></div>
                       </label>
+                    </div>
+
+                    {/* Subtitles */}
+                    <div className="bg-slate-800/30 border border-slate-700/50 rounded-xl p-4 mb-6">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <Icons.FileVideo className="w-4 h-4 text-indigo-300" />
+                          <span className="text-sm font-semibold text-white">
+                            Subtitles
+                          </span>
+                        </div>
+                        <span className="text-[11px] text-slate-400">
+                          Embed when available
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        Subtitle selection is coming soon. Enable Server Mode to
+                        fetch caption tracks; we’ll add a picker here.
+                      </div>
                     </div>
 
                     <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
@@ -779,27 +927,53 @@ function App() {
         )}
       </main>
 
+      {downloadState === "downloading" && (
+        <div className="fixed bottom-4 left-4 right-4 z-40 sm:hidden">
+          <div className="bg-slate-900/90 border border-slate-700 rounded-xl p-3 shadow-2xl shadow-black/40">
+            <div className="flex items-center justify-between text-xs text-slate-300 mb-2">
+              <span className="font-semibold">
+                {convertToMp3 ? "MP3 download" : "Download in progress"}
+              </span>
+              <span className="font-mono">{Math.round(progress)}%</span>
+            </div>
+            <div className="h-2 bg-slate-800 rounded-full overflow-hidden mb-2">
+              <div
+                className={`h-full ${
+                  convertToMp3
+                    ? "bg-gradient-to-r from-pink-500 to-rose-500"
+                    : "bg-gradient-to-r from-indigo-500 to-purple-500"
+                }`}
+                style={{ width: `${progress}%` }}
+              ></div>
+            </div>
+            <div className="flex items-center justify-between text-[11px] text-slate-400 font-mono">
+              <span>{stats.speed}</span>
+              <span>ETA {stats.eta}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      
       {/* Footer Info */}
       <footer className="mt-10 border-t border-slate-800/70 bg-slate-950/80 backdrop-blur px-4">
         <div className="max-w-4xl mx-auto py-3 flex flex-col sm:flex-row items-center justify-between gap-2 text-[11px] text-slate-500">
           <div className="flex items-center gap-2 justify-center">
-            <span className="text-slate-200 font-semibold">
-              ApsaraFlow v2.0
-            </span>
-            <span
-              className={`px-2 py-0.5 rounded-full text-[10px] border ${
-                config.useServer
-                  ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
-                  : "bg-slate-700/40 text-slate-300 border-slate-600/60"
-              }`}
-            >
-              {config.useServer ? "Server Mode" : "Demo Mode"}
-            </span>
+            <div className="flex items-center gap-2 group cursor-default">
+              <span>BUILT_BY:</span>
+              <span className="text-slate-300 font-bold group-hover:text-red-500 transition-colors">
+                KROMA_DEV_TEAM
+              </span>
+              <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+            </div>
           </div>
-          <div className="opacity-60">
-            {config.useServer
-              ? "Powered by your backend yt-dlp."
-              : "Enable Server Mode in settings to use real yt-dlp."}
+          <div className="flex items-center gap-4 text-xs font-medium text-slate-400">
+            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-white/5 border border-white/5 hover:border-red-500/30 transition-colors cursor-default">
+              <span>🇰🇭</span>
+              <span className="hidden sm:inline uppercase tracking-wider text-slate-300">
+                Cambodia Needs Peace
+              </span>
+            </div>
           </div>
         </div>
       </footer>

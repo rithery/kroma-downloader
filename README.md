@@ -1,4 +1,4 @@
-# ApsaraFlow - Khmer-Inspired Video Downloader
+# KROMA: ក្រមា Downloader
 
 A modern, Khmer-inspired web interface for `yt-dlp`.  
 Features video quality selection, high-res MP3 conversion, and AI-powered metadata analysis.

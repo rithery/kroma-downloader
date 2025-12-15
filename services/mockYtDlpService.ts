@@ -19,13 +19,15 @@ export interface DownloadProgress {
 export interface ApiConfig {
   useServer: boolean;
   serverUrl: string;
+  filenameTemplate?: string;
 }
 
 // Default to true. We use 127.0.0.1 because 'localhost' can sometimes 
 // fail due to IPv4/IPv6 resolution differences in Node vs Browser.
 let currentConfig: ApiConfig = {
   useServer: true,
-  serverUrl: 'http://127.0.0.1:8000'
+  serverUrl: 'http://127.0.0.1:8000',
+  filenameTemplate: '{title}'
 };
 
 export const updateApiConfig = (config: Partial<ApiConfig>) => {
@@ -125,6 +127,10 @@ const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
     if (error.name === 'AbortError') {
         throw new Error("Request timed out. The server took too long to respond.");
     }
+    const urlLower = url.toLowerCase();
+    if (urlLower.includes('facebook.com') || urlLower.includes('fb.watch')) {
+        throw new Error("Facebook links often require login cookies. Provide a cookies.txt to the backend or ensure the video is public.");
+    }
     
     throw error;
   }
@@ -135,6 +141,9 @@ const downloadVideoReal = async (url: string, formatId: string, onProgress: (dat
     let endpoint = `${baseUrl}/api/download?url=${encodeURIComponent(url)}&format=${formatId}`;
     if (convertToMp3) {
         endpoint += `&convert_to_mp3=true`;
+    }
+    if (currentConfig.filenameTemplate) {
+        endpoint += `&filename_template=${encodeURIComponent(currentConfig.filenameTemplate)}`;
     }
     
     try {
