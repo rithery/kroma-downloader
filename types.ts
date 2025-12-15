@@ -26,8 +26,21 @@ export interface VideoInfo {
   webpage_url: string;
 }
 
+export interface PlaylistInfo {
+  id: string;
+  title: string;
+  uploader: string;
+  thumbnail: string;
+  description: string;
+  webpage_url: string;
+  video_count: number;
+  videos: VideoInfo[];
+}
+
 export interface AiMetadataResult {
   summary: string;
   tags: string[];
   suggestedFileName: string;
 }
+
+export type MediaInfo = VideoInfo | PlaylistInfo;

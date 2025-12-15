@@ -66,24 +66,75 @@ async def root() -> Dict[str, str]:
 async def fetch_info(url: str = Query(..., description="Video or audio URL")) -> Dict[str, Any]:
     """Return metadata for the provided URL using yt-dlp."""
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as ydl:
+        # First check if it's a playlist by extracting info without noplaylist
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": True}) as ydl:
             info = ydl.extract_info(url, download=False)
+            
+        # Check if it's a playlist
+        if info.get('_type') == 'playlist':
+            # It's a playlist, return playlist info
+            playlist_keys = [
+                "id",
+                "title", 
+                "uploader",
+                "uploader_id",
+                "thumbnail",
+                "description",
+                "webpage_url",
+            ]
+            
+            playlist_info = {key: info.get(key) for key in playlist_keys}
+            playlist_info["video_count"] = len(info.get('entries', []))
+            
+            # Get detailed info for each video (limit to first 50 for performance)
+            videos = []
+            entries = info.get('entries', [])[:50]  # Limit to 50 videos
+            
+            for entry in entries:
+                if entry:
+                    try:
+                        # Extract full info for each video
+                        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True}) as video_ydl:
+                            video_info = video_ydl.extract_info(entry['url'], download=False)
+                            
+                        video_keys = [
+                            "id",
+                            "title",
+                            "uploader",
+                            "uploader_id", 
+                            "thumbnail",
+                            "duration",
+                            "view_count",
+                            "description",
+                            "webpage_url",
+                            "formats",
+                        ]
+                        videos.append({key: video_info.get(key) for key in video_keys if key in video_info or key == "formats"})
+                    except Exception:
+                        # Skip videos that fail to load
+                        continue
+            
+            playlist_info["videos"] = videos
+            playlist_info["_type"] = "playlist"
+            return playlist_info
+        else:
+            # It's a single video
+            keys = [
+                "id",
+                "title",
+                "uploader",
+                "uploader_id",
+                "thumbnail",
+                "duration",
+                "view_count",
+                "description",
+                "webpage_url",
+                "formats",
+            ]
+            return {key: info.get(key) for key in keys if key in info or key == "formats"}
+            
     except Exception as exc:  # pragma: no cover - passthrough error handling
         raise HTTPException(status_code=400, detail=str(exc))
-
-    keys = [
-        "id",
-        "title",
-        "uploader",
-        "uploader_id",
-        "thumbnail",
-        "duration",
-        "view_count",
-        "description",
-        "webpage_url",
-        "formats",
-    ]
-    return {key: info.get(key) for key in keys if key in info or key == "formats"}
 
 
 @app.get("/api/download")

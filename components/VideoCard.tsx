@@ -9,9 +9,10 @@ interface VideoCardProps {
 export const VideoCard: React.FC<VideoCardProps> = ({ info }) => {
   const [imgError, setImgError] = useState(false);
 
-  const formatDuration = (seconds: number) => {
+  const formatDuration = (seconds?: number) => {
+    if (!Number.isFinite(seconds) || seconds! < 0) return '—';
     const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
 
@@ -37,12 +38,12 @@ export const VideoCard: React.FC<VideoCardProps> = ({ info }) => {
       </div>
       
       <div className="flex-1 space-y-2">
-        <h2 className="text-xl font-bold text-white leading-tight">{info.title}</h2>
-        <p className="text-indigo-400 font-medium">{info.uploader}</p>
-        <p className="text-sm text-slate-400 line-clamp-2">{info.description}</p>
+        <h2 className="text-xl font-bold text-white leading-tight">{info.title || 'Untitled item'}</h2>
+        <p className="text-indigo-400 font-medium">{info.uploader || 'Unknown uploader'}</p>
+        <p className="text-sm text-slate-400 line-clamp-2">{info.description || 'No description provided.'}</p>
         <div className="pt-2 flex items-center gap-4 text-xs text-slate-500">
-           <span>{info.view_count.toLocaleString()} views</span>
-           <span>ID: {info.id}</span>
+           <span>{(info.view_count || 0).toLocaleString()} views</span>
+           <span>ID: {info.id || 'N/A'}</span>
         </div>
       </div>
     </div>

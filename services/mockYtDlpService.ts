@@ -1,4 +1,4 @@
-import { VideoInfo, FormatType } from '../types';
+import { VideoInfo, FormatType, PlaylistInfo, MediaInfo } from '../types';
 
 /**
  * SERVICE CONFIGURATION
@@ -36,7 +36,7 @@ export const getApiConfig = () => currentConfig;
 
 // --- REAL IMPLEMENTATION ---
 
-const fetchVideoInfoReal = async (url: string): Promise<VideoInfo> => {
+const fetchVideoInfoReal = async (url: string): Promise<MediaInfo> => {
   // Ensure no trailing slash
   const baseUrl = currentConfig.serverUrl.replace(/\/$/, '');
   const endpoint = `${baseUrl}/api/info?url=${encodeURIComponent(url)}`;
@@ -61,6 +61,39 @@ const fetchVideoInfoReal = async (url: string): Promise<VideoInfo> => {
     }
     const data = await res.json();
     
+    // Check if it's a playlist
+    if (data._type === 'playlist') {
+      return {
+        id: data.id,
+        title: data.title,
+        uploader: data.uploader || data.uploader_id || 'Unknown',
+        thumbnail: data.thumbnail,
+        description: data.description || '',
+        webpage_url: data.webpage_url,
+        video_count: data.video_count || 0,
+        videos: (data.videos || []).map((v: any) => ({
+          id: v.id,
+          title: v.title,
+          uploader: v.uploader || v.uploader_id || 'Unknown',
+          thumbnail: v.thumbnail,
+          duration: v.duration,
+          view_count: v.view_count || 0,
+          description: v.description || '',
+          webpage_url: v.webpage_url,
+          formats: (v.formats || []).map((f: any) => ({
+            format_id: f.format_id,
+            ext: f.ext,
+            resolution: f.resolution || (f.width && f.height ? `${f.width}x${f.height}` : 'audio only'),
+            note: f.format_note,
+            type: (f.vcodec === 'none' || !f.vcodec) && f.acodec !== 'none' ? FormatType.AUDIO : FormatType.VIDEO,
+            filesize: f.filesize || f.filesize_approx,
+            vcodec: f.vcodec,
+            acodec: f.acodec
+          })).filter((f: any) => f.format_id)
+        }))
+      } as PlaylistInfo;
+    }
+    
     // Transform backend data to our frontend VideoInfo interface
     return {
       id: data.id,
@@ -81,7 +114,7 @@ const fetchVideoInfoReal = async (url: string): Promise<VideoInfo> => {
         vcodec: f.vcodec,
         acodec: f.acodec
       })).filter((f: any) => f.format_id) // ensure valid formats
-    };
+    } as VideoInfo;
   } catch (error: any) {
     console.error("Real API Error Details:", error);
     
@@ -312,7 +345,7 @@ const downloadVideoMock = (formatId: string, onProgress: (data: DownloadProgress
 
 // --- PUBLIC API DELEGATES ---
 
-export const fetchVideoInfo = async (url: string): Promise<VideoInfo> => {
+export const fetchVideoInfo = async (url: string): Promise<MediaInfo> => {
     if (currentConfig.useServer) {
         return fetchVideoInfoReal(url);
     }
